@@ -1,0 +1,12 @@
+# 开发过程的会话日志（本地留存，不进版本库）
+dsh-session-*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
