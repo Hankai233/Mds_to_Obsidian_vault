@@ -1,0 +1,9 @@
+# 统一按 LF 存储与检出，避免不同平台/autocrlf 设置下正文被改写
+# 这个技能的核心承诺是「正文一字不动」，行尾漂移会被当成内容改动
+* text=auto eol=lf
+
+# 二进制文件不参与文本转换
+*.zip binary
+*.png binary
+*.jpg binary
+*.pdf binary
