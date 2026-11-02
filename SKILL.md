@@ -4,9 +4,10 @@ description: >
   Use when a markdown notes folder or Obsidian vault has become unusable: notes
   flat at the root, one 3000-line file that should be thirty notes, no
   frontmatter, no backlinks, broken relative links, dead MOCs — and the user
-  asks to 整理 / 重构 / 规范化 / 拆分 / 建知识库 / 归档. Also use when they ask
-  how to connect Obsidian to an AI (MCP vs direct file access), or how to keep
-  an AI from rewriting their notes.
+  asks to 整理 / 重构 / 规范化 / 拆分 / 建知识库 / 归档. Also use for a messy
+  code or docs repository whose markdown should become an orderly, linked vault
+  (仓库整理 / 文档站保持导航不动), when they ask how to connect Obsidian to an AI
+  (MCP vs direct file access), or how to keep an AI from rewriting their notes.
 license: MIT
 ---
 
@@ -38,11 +39,40 @@ license: MIT
 | 记一条新东西 | 增量流程：查重 → 落一篇 → 挂 MOC → 更新入链 |
 | 只是问问题 | 只读，不写任何文件 |
 
+**先判仓库还是笔记库，再决定要不要搬。** `inventory.py` 报 `code-repo` / `docs-site` / `mixed` 时，先看这两条：
+
+- **`docs-site`**（有 `mkdocs.yml` / `_sidebar.md` / VuePress、Docusaurus 配置）：目录本身就是导航，路径被配置硬编码。**不要套 `00_`/`10_` 骨架，不要搬文件改名**，否则站点直接 404。只做三件事：给笔记类 md 补 frontmatter、修真实死链、在现有目录下补一篇 MOC 索引。用户坚持重组时，先改导航配置再搬文件，并把被导航引用的路径逐条列进映射表。
+- **`code-repo`**：代码、构建产物、依赖目录（`node_modules`、`dist`、`.venv`）一律不碰；只对 `docs/`、`*.md` 说明文件按笔记规则处理。
+
+`move_blocked` 里列出的路径，就是「搬了会坏」的清单。
+
 ## 改造流程
+
+### 0. 基线快照（先做，做不了就别开工）
+
+改造前的库必须留下一份可以逐字节比对的底本：
+
+```bash
+git init && git add -A && git commit -m "baseline: 改造前"
+git tag pre-vault-refactor        # 已有 git 仓库时：确认 git status 干净，再打标签
+```
+
+提交前先确认本机配了 git 身份；报 `Author identity unknown` 就在**该仓库内**补一次
+`git config user.name "vault-refactor" && git config user.email "vault-refactor@local"`（不碰全局配置）。
+
+目标库不方便进 git 时，把整库复制到会话工作区 `_baseline/` 存着。**没有基线快照，「没丢内容」「正文没改」两句话都无法自证**，直接停机问用户，不要靠「我很小心」开工。
 
 ### 1. 盘点（不许跳过）
 
-- 文件清单、每个文件的行数与修改时间、现有目录结构
+先跑盘点工具，别靠肉眼和 `ls`：
+
+```bash
+python scripts/inventory.py <vault_root>          # 人类可读
+python scripts/inventory.py <vault_root> --json   # 机器可读，便于自己二次筛
+```
+
+它给出：文件与扩展名分布、每篇 md 的行数/出链/嵌入/BOM/CRLF、切分候选榜（按 `^## N.` 计数）、重名与疑似重复、失效链接与代码仓库锚点、附件孤儿、工程类型（`notes-vault` / `code-repo` / `docs-site` / `mixed`）、以及被文档站导航引用的路径。人工补充：
+
 - **现有的 `AGENTS.md` / `README.md` 要读，但不要盲从**——它很可能就是这次问题的来源（比如写着「所有笔记放根目录」）
 - 统计长篇文件里的切分单位：`## N.` 这类同级标题有几个，就是几篇
 - 已经存在的双链与相对链接先扫一遍，记下哪些是失效的
@@ -56,9 +86,10 @@ license: MIT
 20_MOC/     主题入口与导航       30_Sources/ 原文存档
 40_Projects/ 有产出的项目       90_Journal/ 日志（无内容不建）
 99_Archive/ 归档（淘汰不删除）   _templates/ 模板
+_attachments/ 附件（图片/PDF/表格）
 ```
 
-不建空目录。`90_Journal/`、`99_Archive/` 没有内容就不创建。
+不建空目录。`90_Journal/`、`99_Archive/` 没有内容就不创建；`_attachments/` 只在真有附件要搬时创建。
 
 ### 3. 机械拆分（改造的主战场）
 
@@ -73,6 +104,7 @@ license: MIT
 - 原文存档那一篇，每篇新笔记的 `source` 用双链指回它（`source: "[[面试题库原文]]"`），而不是写原路径字符串
 - 拆完的每一篇都要能在原文里指回自己的位置（存档笔记的目录/标题就是索引）
 - 不拆的情况：不足 150 行；结构不是按标题组织的（长表格、时间线、代码清单）
+- **附件（图片/PDF/表格/音视频）原样复制到 `_attachments/`**，正文里的 `![[图.png]]` 保留原文件名。Obsidian 按文件名全库解析嵌入，所以搬目录不用改引用；改名会产生 `broken-embed`，等于制造死链
 
 ### 4. 连接
 
@@ -87,7 +119,15 @@ license: MIT
 python scripts/validate_vault.py <vault_root>
 ```
 
-必须 **0 错误**才能进下一步。然后：
+必须 **0 错误**才能进下一步。拆分过的库再跑一次往返检查，逐篇证明正文没被动过：
+
+```bash
+python scripts/roundtrip_check.py <vault_root>
+```
+
+它要求每篇拆出来的笔记，正文必须是 `30_Sources/` 存档正文的**连续子序列**（允许整段少，不允许改一个字），标题只允许降级一级。退出码非 0 就是有人「顺手改好了」。这比 `git rename` 相似度强：相似度只能证明原件进了存档，证明不了拆出来的每一篇没被改写。
+
+然后：
 
 1. 暂存区（会话工作区内）建好全部产物
 2. 逐文件比对字节数，一致才算复制成功
@@ -128,6 +168,11 @@ python scripts/validate_vault.py <vault_root>
 - `WARN` 里的孤儿笔记要逐条处理（真孤儿挂 MOC，模板与索引文件豁免）
 - 「正文零出链」是 ERROR：拆出来的笔记必须自己写 `## 相关`，不要指望 MOC 兜底
 - 「代码仓库锚点」那一栏是**正常情况**，只是告诉你这里有多少个指向库外的锚点，不要动它们
+- `![[图.png]]` 这类**嵌入**走附件解析：文件存在就算通过，不会要求你把它改成笔记双链；不存在才报 `broken-embed`
+- 全路径双链（`[[notes/a/Guide]]`）与带 `<尖括号>`/`%20` 的 markdown 链接都按真实路径解析
+- `--json` 输出可被程序解析（`errors` / `warnings` / `code_anchors` / `exit_code`），`--max-errors N` 调文本模式的上限（JSON 永不截断）
+- `fence-unclosed` 说明有围栏没闭合，其后内容被当成代码、链接检查已跳过——先补围栏再看链接结论
+- 退出码：`0` 无错误（警告允许）· `1` 有错误 · `2` 用法错误
 
 ## 平台坑（都是踩过的）
 

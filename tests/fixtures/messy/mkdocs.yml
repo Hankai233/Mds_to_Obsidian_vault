@@ -1,0 +1,5 @@
+site_name: 杂乱样本
+docs_dir: docs
+nav:
+  - 首页: docs/x.md
+  - 指南: docs/guide.md
