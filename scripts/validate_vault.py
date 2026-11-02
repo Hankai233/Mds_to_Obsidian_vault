@@ -2,9 +2,16 @@
 """Validate a markdown knowledge vault (Obsidian-style) before and after a refactor.
 
 用法：
-    python validate_vault.py <vault_root> [--quiet] [--json] [--max-errors N]
+    python validate_vault.py <vault_root> [--profile vault|docs-site]
+                             [--quiet] [--json] [--max-errors N]
 
 退出码：0 = 无错误（警告允许），1 = 有错误，2 = 用法错误。
+
+模式（--profile）：
+    vault      默认。笔记库语义：要求出链、要求 MOC 索引、根目录不许放笔记。
+    docs-site  文档站语义：页面由 mkdocs/docusaurus 的 nav 组织，不要求互链，
+               因此跳过 no-outbound / one-outbound / orphan / evergreen-no-inbound /
+               not-indexed-by-moc / root-note。frontmatter、死链、重名等照旧检查。
 
 检查项（ERROR，rule id 固定，不可改名）：
 
@@ -39,6 +46,11 @@
 
 约定：
   * 围栏代码块（``` 或 ~~~，允许行首缩进）先被剥离再扫链接，未闭合的围栏延伸到文件末尾。
+  * HTML 注释 <!-- -->、Obsidian 注释 %%...%%、行内代码 `...`、缩进代码块
+    （空行后 ≥4 空格）里的 [[X]] 不是链接，剥掉不算；这些是写给人的，
+    agent 不该为了清零错误去改它。
+  * 逃出 vault 的相对链接：指向源码树（含代码扩展名或 src/ 等目录）记为锚点；
+    目标存在但不是代码 → WARN outside-link；目标不存在 → ERROR broken-relative-link。
   * ![[x.png]] 且扩展名属于附件集时按「附件嵌入」处理：找到即静默通过，不计入
     inbound/outbound；找不到报 broken-embed。![[某笔记]] 仍按普通双链处理。
   * [[notes/a/Guide]] 这种全路径双链先按「去掉 .md 的库内相对路径」匹配，
@@ -114,12 +126,64 @@ H1_RE = re.compile(r"^ {0,3}#[ \t]+(.+?)[ \t]*$", re.M)
 FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 FENCE_CLOSE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+OBSIDIAN_COMMENT_RE = re.compile(r"%%.*?%%", re.S)
+INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+INDENT_CODE_RE = re.compile(r"^(?: {4,}|\t)")
+BLOCK_PREFIX_RE = re.compile(r"^(?:[-*+]\s|\d+[.)]\s|>)")
 SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
 def looks_like_code(target):
     """判断一个 markdown 链接是否指向源码树而不是本库文件。"""
     return bool(CODE_PATH_HINT.search(target))
+
+
+def blank_keep_lines(text):
+    """把一段文本换成等量换行，保证行数不变（报错的行号不会整体偏移）。"""
+    return re.sub(r"[^\n]", " ", text)
+
+
+def strip_comments(text):
+    """剥掉 HTML 注释、Obsidian 注释（%%...%%）与行内代码。
+
+    这三种位置里的 [[链接]] 都不是链接：不剥的话 agent 会为了清零错误去改
+    注释或行内代码，反而违反了「不改正文」这条硬边界。
+    """
+    text = INLINE_CODE_RE.sub(lambda m: blank_keep_lines(m.group(0)), text)
+    text = HTML_COMMENT_RE.sub(lambda m: blank_keep_lines(m.group(0)), text)
+    return OBSIDIAN_COMMENT_RE.sub(lambda m: blank_keep_lines(m.group(0)), text)
+
+
+def strip_indented_code(text):
+    """剥掉缩进代码块（空行起头、缩进 ≥4 格或 tab、且不是列表/引用/表格行）。
+
+    只剥真正的代码块：列表项的第二行（`    - [[x]]`）保留，宁可少剥不要误剥。
+    """
+    out = []
+    prev_blank = True
+    in_code = False
+    for line in text.splitlines(keepends=True):
+        raw = line.rstrip("\r\n")
+        keyword = "\n" if line.endswith(("\n", "\r")) else ""
+        if in_code:
+            if not raw.strip():
+                in_code = False
+                prev_blank = True
+            out.append(keyword)
+            continue
+        if (
+            prev_blank
+            and INDENT_CODE_RE.match(raw)
+            and not BLOCK_PREFIX_RE.match(raw.lstrip(" \t"))
+        ):
+            in_code = True
+            out.append(keyword)
+            prev_blank = False
+            continue
+        out.append(line)
+        prev_blank = not raw.strip()
+    return "".join(out)
 
 
 def strip_fences(text):
@@ -293,7 +357,8 @@ class Findings:
         (self.errors if bucket == "error" else self.warnings).append(item)
 
 
-def scan(vault):
+def scan(vault, profile="vault"):
+    docs_mode = profile == "docs-site"
     findings = Findings()
     md_files, all_files = collect_files(vault)
 
@@ -318,6 +383,10 @@ def scan(vault):
         fm = parse_fields(fm_block) if fm_block is not None else {}
         body, fence_unclosed = strip_fences(raw)      # 含 frontmatter：算入链
         body_nofm, _ = strip_fences(nofm)             # 不含 frontmatter：算出链
+        # 注释（<!-- -->、%%...%%）与缩进代码块里的 [[X]] 不是链接：
+        # 不剥的话 agent 会为了清零错误去改注释，反而违反「不改正文」。
+        body = strip_indented_code(strip_comments(body))
+        body_nofm = strip_indented_code(strip_comments(body_nofm))
         records.append({
             "path": path,
             "rel": rel,
@@ -497,8 +566,27 @@ def scan(vault):
             except ValueError:
                 inside_vault = False
             exists = resolved.exists()
-            if not inside_vault or (not exists and looks_like_code(clean)):
-                # 指向源码仓库，不是本库文件：正常的锚点，不改也不删
+            codey = looks_like_code(clean)
+            if not inside_vault:
+                if exists and codey:
+                    # 指向源码仓库且文件真实存在：正常锚点
+                    anchors.append((rel, clean))
+                elif exists:
+                    findings.add(
+                        "warn", rel, "outside-link",
+                        f"相对链接指向 vault 外已存在的文件 -> {clean}",
+                    )
+                elif codey:
+                    # 代码路径但文件不在：仍登记为锚点（代码仓库可能不在本机）
+                    anchors.append((rel, clean))
+                else:
+                    findings.add(
+                        "error", rel, "broken-relative-link",
+                        f"失效相对链接（逃出 vault 且目标不存在）-> {clean}",
+                    )
+                continue
+            if not exists and codey:
+                # 库内不存在的代码路径：登记为锚点，不报错
                 anchors.append((rel, clean))
                 continue
             if not exists:
@@ -517,12 +605,17 @@ def scan(vault):
 
         # ---- 出链数量约束 ----
         in_archive = rel.startswith(EXEMPT_LINK_CHECK_PREFIXES)
-        if note_type in {"note", "project"} and not in_archive:
+        if note_type in {"note", "project"} and not in_archive and not docs_mode:
             n = outbound[path]
             if n == 0:
                 findings.add(
                     "error", rel, "no-outbound",
-                    f"正文零出链（要求 ≥2 条双链，只写 source 不算）",
+                    "正文零出链（要求 ≥2 条双链，只写 source 不算）"
+                    + (
+                        "；该文件有未闭合围栏，其后的 `## 相关` 会被当作代码，先闭合围栏再复查"
+                        if rec["fence_unclosed"]
+                        else ""
+                    ),
                 )
             elif n == 1:
                 findings.add(
@@ -568,7 +661,7 @@ def scan(vault):
         fm = rec["fm"]
         sources = inbound_sources.get(path, set())
 
-        if not sources:
+        if not sources and not docs_mode:
             if (
                 path.stem not in ORPHAN_EXEMPT_STEMS
                 and rel not in ORPHAN_EXEMPT_PATHS
@@ -576,15 +669,21 @@ def scan(vault):
             ):
                 findings.add("warn", rel, "orphan", "孤儿笔记（零入链）")
 
-        if unquote(fm.get("status", "")) == "evergreen" and not sources:
+        if (
+            unquote(fm.get("status", "")) == "evergreen"
+            and not sources
+            and not docs_mode
+        ):
             findings.add(
                 "warn", rel, "evergreen-no-inbound",
                 "status=evergreen 但没有任何入链",
             )
 
         note_type = unquote(fm.get("type", ""))
-        if note_type in {"note", "project"} and not rel.startswith(
-            EXEMPT_LINK_CHECK_PREFIXES
+        if (
+            note_type in {"note", "project"}
+            and not docs_mode
+            and not rel.startswith(EXEMPT_LINK_CHECK_PREFIXES)
         ):
             moc_inbound = any(
                 type_by_path.get(src) == "moc" for src in sources
@@ -595,7 +694,7 @@ def scan(vault):
                     "没有任何 type: moc 的笔记链入（没有被 MOC 索引到）",
                 )
 
-        if "/" not in rel and path.stem not in ROOT_NOTE_EXEMPT_STEMS:
+        if not docs_mode and "/" not in rel and path.stem not in ROOT_NOTE_EXEMPT_STEMS:
             findings.add(
                 "warn", rel, "root-note",
                 "笔记直接放在 vault 根目录（应移入 10_Notes/ 等目录）",
@@ -606,6 +705,7 @@ def scan(vault):
 
     return {
         "vault": vault,
+        "profile": profile,
         "md_files": md_files,
         "errors": findings.errors,
         "warnings": findings.warnings,
@@ -618,6 +718,9 @@ def print_human(result, quiet, max_errors):
     warnings = result["warnings"]
     anchors = result["code_anchors"]
     print(f"Vault: {result['vault']}")
+    profile = result.get("profile", "vault")
+    label = "笔记库（vault）" if profile == "vault" else "文档站（docs-site：不要求页面互链）"
+    print(f"模式: {label}")
     print(f"markdown 文件: {len(result['md_files'])}")
     if not quiet:
         for w in warnings:
@@ -646,8 +749,8 @@ def print_human(result, quiet, max_errors):
 
 
 def parse_args(argv):
-    """返回 (vault_arg, quiet, as_json, max_errors)；用法错误返回 None。"""
-    vault_arg, quiet, as_json, max_errors = None, False, False, 200
+    """返回 (vault_arg, quiet, as_json, max_errors, profile)；用法错误返回 None。"""
+    vault_arg, quiet, as_json, max_errors, profile = None, False, False, 200, "vault"
     rest = argv[1:]
     i = 0
     while i < len(rest):
@@ -656,6 +759,16 @@ def parse_args(argv):
             quiet = True
         elif arg == "--json":
             as_json = True
+        elif arg == "--profile":
+            if i + 1 >= len(rest) or rest[i + 1] not in ("vault", "docs-site"):
+                return None
+            profile = rest[i + 1]
+            i += 1
+        elif arg.startswith("--profile="):
+            value = arg.split("=", 1)[1]
+            if value not in ("vault", "docs-site"):
+                return None
+            profile = value
         elif arg == "--max-errors":
             if i + 1 >= len(rest):
                 return None
@@ -684,7 +797,7 @@ def parse_args(argv):
         i += 1
     if vault_arg is None:
         return None
-    return vault_arg, quiet, as_json, max_errors
+    return vault_arg, quiet, as_json, max_errors, profile
 
 
 def main(argv):
@@ -695,20 +808,21 @@ def main(argv):
     if parsed is None:
         print(__doc__)
         return 2
-    vault_arg, quiet, as_json, max_errors = parsed
+    vault_arg, quiet, as_json, max_errors, profile = parsed
     vault = Path(vault_arg).expanduser().resolve()
     if not vault.is_dir():
         # 用法错误：走 stderr，stdout 不产出半截 JSON
         print(f"不是目录: {vault}", file=sys.stderr)
         return 2
 
-    result = scan(vault)
+    result = scan(vault, profile)
     errors = result["errors"]
     exit_code = 1 if errors else 0
 
     if as_json:
         payload = {
             "vault": str(result["vault"]),
+            "profile": result["profile"],
             "md_files": len(result["md_files"]),
             "errors": errors,
             "warnings": result["warnings"],

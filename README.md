@@ -72,7 +72,7 @@ Copy-Item -Recurse -Force .\* $dst
 
 ### 3. 过程
 
-agent 会分七步走。**第 0 步先打基线快照**（git commit + tag，或整库复制到 `_baseline/`）；**第 2 步会先给出「旧路径 → 新路径」映射表等你确认**；旧文件只有在副本校验通过、并且你点头之后才会被删除：
+agent 会分八步走（第 0 步基线快照 + 七步改造）。**第 0 步先打基线快照**（git commit + tag，或整库复制到 `_baseline/`）；**第 2 步会先给出「旧路径 → 新路径」映射表等你确认**；旧文件只有在副本校验通过、并且你点头之后才会被删除：
 
 ```
 基线快照 → 盘点 → 设计映射 → 机械拆分 → 建链接 → 校验 → 安装 → 提交
@@ -83,7 +83,9 @@ agent 会分七步走。**第 0 步先打基线快照**（git commit + tag，或
 ```bash
 python scripts/inventory.py <vault_root>       # 动手前：先看清楚烂在哪
 python scripts/validate_vault.py <vault_root>  # 安装前：必须 0 错误
+python scripts/validate_vault.py <vault_root> --profile docs-site  # 文档站：不要求页面互链
 python scripts/roundtrip_check.py <vault_root> # 拆分过的库：逐篇证明正文没被改
+python scripts/roundtrip_check.py <vault_root> --require-full  # 严格：有子笔记就必须逐行覆盖
 ```
 
 安装后自查：
@@ -93,7 +95,7 @@ git show --stat        # 原文件应显示为 rename，相似度 >90%；过低�
 git revert <commit>    # 不满意就整体回滚
 ```
 
-想先确认工具链本身没坏，跑 `python tests/run_eval.py`（18 项，含四个夹具库）。
+想先确认工具链本身没坏，跑 `python tests/run_eval.py`（40 项，含七个夹具库）。
 
 ## 仓库结构
 
@@ -140,7 +142,10 @@ python scripts/inventory.py <vault_root> --top 20 --max-files 500
 
 - **围栏内的链接不算死链**（与校验器同一套状态机）；围栏没闭合时单独提示「围栏未闭合，其后链接未检查」，不把后面的正文当死链。
 - **`doc_refs` 分三种状态**：没有导航配置 / 导航引用了 N 个路径且都存在（才给 `move_blocked`）/ 配置与文件已脱节（`existing: 0`，先核对 `docs_dir` 与 `nav`，此时不要据此移动文件）。
-- `--json` 顶层含 `files dirs md_files dead_links duplicates attachments doc_refs hygiene big_files build_systems code_anchors fence_unclosed project_kind recommendations` 等字段，可程序化消费。
+- **注释、行内代码、缩进代码块里的 `[[X]]` 不算死链**（`%%...%%`、`<!-- -->`、行内反引号、空行后 4 空格缩进），与校验器同一口径。
+- **`case_mismatch` 与 `dead_links` 分开报**：`[[guide]]` 对上 `Guide.md` 归 `case_mismatch`（`{path,target,actual}`），不再混进死链；大小写口径与校验器一致（严格匹配）。
+- **`split_too_small`**：总行数 <40 或每节平均 <8 行的文档不推荐拆分，单独列出并给 `reason`，不混进切分候选榜。
+- `--json` 顶层含 `files dirs md_files dead_links duplicates attachments doc_refs hygiene big_files build_systems code_anchors fence_unclosed project_kind recommendations split_too_small case_mismatch` 等字段，可程序化消费。
 
 ### 校验：`validate_vault.py`
 
@@ -149,11 +154,14 @@ python scripts/validate_vault.py <vault_root>                 # 完整输出
 python scripts/validate_vault.py <vault_root> --quiet         # 只输出结论
 python scripts/validate_vault.py <vault_root> --json          # 程序可读
 python scripts/validate_vault.py <vault_root> --max-errors 50 # 文本模式上限（默认 200）
+python scripts/validate_vault.py <vault_root> --profile docs-site  # 文档站语义
 ```
 
 退出码：`0` 无错误（警告允许）· `1` 有错误 · `2` 用法错误。可直接接进 CI。
 
-`--json` 顶层：`{"vault","md_files","errors":[{"path","rule","message"}],"warnings":[...],"code_anchors":[{"path","target"}],"exit_code"}`，永不截断。
+`--profile docs-site` 用于 mkdocs/VuePress 这类文档站：页面由导航配置组织，不要求互链，因此跳过 `no-outbound` / `one-outbound` / `orphan` / `evergreen-no-inbound` / `not-indexed-by-moc` / `root-note`；frontmatter、死链、重名、标题层级照旧检查。默认 `--profile vault`。
+
+`--json` 顶层：`{"vault","profile","md_files","errors":[{"path","rule","message"}],"warnings":[...],"code_anchors":[{"path","target"}],"exit_code"}`，永不截断。
 
 **ERROR（15 条）**
 
@@ -171,9 +179,9 @@ python scripts/validate_vault.py <vault_root> --max-errors 50 # 文本模式上�
 | `dup-stem` | 两篇同名 `.md`，双链会指向歧义 |
 | `source-broken` | `type: source` 的 `source` 字段没有指回它的存档关系 |
 
-**WARN（11 条）**
+**WARN（12 条）**
 
-`orphan`（零入链）· `one-outbound`（只有 1 条出链）· `title-mismatch`（title 与文件名或首个 H1 不一致）· `filename-space` · `evergreen-no-inbound` · `root-note`（笔记放在库根）· `multi-h1` / `no-h1` · `fence-unclosed`（围栏未闭合）· `not-indexed-by-moc`（没有 MOC 索引到它，`00_Inbox`/`99_Archive` 豁免）
+`orphan`（零入链）· `one-outbound`（只有 1 条出链）· `title-mismatch`（title 与文件名或首个 H1 不一致）· `filename-space` · `evergreen-no-inbound` · `root-note`（笔记放在库根）· `multi-h1` / `no-h1` · `fence-unclosed`（围栏未闭合）· `not-indexed-by-moc`（没有 MOC 索引到它，`00_Inbox`/`99_Archive` 豁免）· `outside-link`（相对链接指向 vault 外已存在的非代码文件，确认是否有意为之）
 
 ### 往返检查：`roundtrip_check.py`
 
@@ -181,6 +189,7 @@ python scripts/validate_vault.py <vault_root> --max-errors 50 # 文本模式上�
 python scripts/roundtrip_check.py <vault_root>
 python scripts/roundtrip_check.py <vault_root> --json
 python scripts/roundtrip_check.py <vault_root> --allow-added "相关,延伸问题"
+python scripts/roundtrip_check.py <vault_root> --require-full   # 严格覆盖
 ```
 
 拆出来的每篇笔记，正文必须是 `30_Sources/` 存档正文的**连续子序列**：允许整段少于原文，不允许改一个字；标题只允许降级一级（`###`→`##`）。退出码 `0` 全过 · `1` 有改写/失配 · `2` 用法错误。
@@ -190,16 +199,20 @@ python scripts/roundtrip_check.py <vault_root> --allow-added "相关,延伸问�
 - `--allow-added` 是**默认值 + 追加**（默认 `相关,延伸问题`，传空串才清空）；允许新增的小节整段不参与比对。
 - `--json` 顶层：`{"vault","sources":[{"path","core_lines","children":[...],"coverage"}],"issues","unlinked_notes","exit_code"}`，每个 child 带 `ok`、`match{start,end}`、`issues[]`（含 `archive_line`/`note_line`/两侧原文）。
 - 覆盖率只累加「连续匹配成功」的行——顺序全乱但每行都在的笔记会显示 0%，这是故意让问题显眼。
+- **`--require-full`**：默认只把「未覆盖」记成 WARN（存档保留全书，没拆全可能是正常取舍）；加上这个开关后，凡是存档已经拆出子笔记、却仍有未覆盖行 → 直接 exit 1。JSON 多出 `require_full`（bool）与 `uncovered_lines`（int）。只统计「有子笔记」的存档，还没拆的不算漏。
+- **标题归一化不会把「第X节」吃成空串**：`第三节` / `第3节` 归一化后若为空会回退原文，报错信息里显示真实标题；`第 3 节`（中间带空格）与 `第三节` 不判等，这是已知取舍。
+- 启动时有一组自检（`self_check`）：归一化断言失败会打 stderr 并 exit 2，避免「标题全空导致全部误判」这类静默故障。
 
 它比 `git rename` 相似度更硬：相似度只能证明原件进了存档，证明不了拆出来的每一篇有没有被顺手改写——后者才是实测里真正发生过的越界。
 
 ## 校验器的判定细节
 
 1. **围栏代码块先被剥离再扫链接**，否则文档里举例的 `[[相关笔记 A]]` 会被当成失效链接。围栏没闭合时，报 `fence-unclosed`，其后内容整体按代码处理（链接检查跳过）。
-2. **行内代码不会被剥离。** 写成 `` `[[X]]` `` 的示例仍会被当作真实链接；写链接示例请用围栏代码块。
+2. **注释、行内代码、缩进代码块都先被剥离**：`%%...%%`、`<!-- -->`、行内 `` `[[X]]` ``、空行后 4 空格缩进的块。这些位置是写给人看的，agent 不该为了清零错误去改它们。（缩进代码块的判据是「前有空行 + 不以列表标记/`>`/`|` 开头」；列表内空行后的 4 空格续行会被当代码块，这是刻意保守的取舍。）
 3. **嵌入与双链分流**：`![[图.png]]` 按附件扩展名集合解析（png/jpg/gif/svg/webp/pdf/docx/xlsx/pptx/mp3/mp4/zip/canvas/excalidraw 等），存在即通过；`![[某笔记]]` 或普通 `[[笔记]]` 按笔记解析。全路径双链 `[[notes/a/Guide]]`、带 `<尖括号>` 与 `%20` 的 markdown 链接都按真实路径解析。
-4. **指向代码仓库的锚点不算死链**，单独汇总成「代码仓库锚点」——不要修它们。
+4. **指向代码仓库的锚点不算死链**，单独汇总成「代码仓库锚点」——不要修它们。逃出 vault 的相对链接按目标分三路：含代码扩展名/`src/` 等目录 → 锚点；目标存在但不是代码 → `WARN outside-link`；目标不存在 → `ERROR broken-relative-link`。
 5. **`00_Inbox/` 与 `99_Archive/` 豁免出链检查与 MOC 索引检查**（未加工输入、归档件不需要自己长链接）。
+   **MOC 自己也要有入链**：新建的 MOC 若没有任何笔记链接它，会报 `orphan`——这是对的，让根 `README.md` 里链一句 `[[总览]]` 即可（README 的链接照样计入入链）。
 6. **大小写敏感**：`[[Guide]]` 不会匹配 `guide.md`。Windows/macOS 上 Obsidian 不区分大小写，Linux 上区分——校验器选严格的一侧，宁可报错也不放过跨平台会坏的链接。
 
 ## 实测效果
@@ -210,7 +223,7 @@ python scripts/roundtrip_check.py <vault_root> --allow-added "相关,延伸问�
 python tests/run_eval.py           # 可加 --verbose 看子进程原始输出
 ```
 
-`tests/fixtures/` 四套夹具：`clean`（必须 0 错误 0 警告）、`messy`（覆盖全部 15 条 ERROR 与 9 条 WARN，且断言 `![[存在的图.png]]` 与 `[[notes/a/Guide]]` 不误报）、`split`（一篇照搬、一篇被同义改写，往返检查必须抓出后者）、`urlsrc`（`source: https://...` 是外部来源不是双链，往返检查不得误报 `source-broken`）。
+`tests/fixtures/` 七套夹具：`clean`（必须 0 错误 0 警告）、`messy`（覆盖全部 15 条 ERROR 与 9 条 WARN，且断言 `![[存在的图.png]]` 与 `[[notes/a/Guide]]` 不误报）、`split`（一篇照搬、一篇被同义改写，往返检查必须抓出后者）、`urlsrc`（`source: https://...` 是外部来源不是双链，往返检查不得误报 `source-broken`）、`comments`（注释/行内代码/缩进代码里的 `[[X]]` 不得误报）、`outside`（逃库链接：源码记锚点、坏链报错）、`docsite`（文档站页面互不链接，`--profile docs-site` 下零错误）、`casematch`（`[[guide]]` 对 `Guide.md`：盘点记 `case_mismatch`、校验器报 `broken-wikilink`，两边口径一致）。`strict` 与 `inventory` 两个用例复用上面的夹具，分别验证 `--require-full` 与 `case_mismatch`。
 
 | 维度 | 无技能 | 有技能 |
 |---|---|---|
@@ -233,7 +246,8 @@ python tests/run_eval.py           # 可加 --verbose 看子进程原始输出
 - **`roundtrip_check.py` 的「未关联存档的笔记」只统计带 frontmatter 的文件**，根 `README.md` 之类不计数。
 - **校验器只查结构，不判断内容真假。** 0 错误 ≠ 笔记写对了，事实与措辞仍要人看。
 - **拆分只认标题结构。** 长表格、时间线、代码清单不适合按 `##` 拆，技能会保留原样而不是硬拆。
-- **大小写按 Linux 语义处理**：`[[Guide]]` 不匹配 `guide.md`。Windows/macOS 上 Obsidian 容忍大小写不一致，校验器不容忍——这是故意的，跨平台库只能取严格侧。
+- **大小写按 Linux 语义处理**：`[[Guide]]` 不匹配 `guide.md`。Windows/macOS 上 Obsidian 容忍大小写不一致，校验器不容忍——这是故意的，跨平台库只能取严格侧。`inventory.py` 已与校验器对齐：这类链接归 `case_mismatch`，不再混进死链数。
+- **`title-mismatch` 与源码锚点在文档站模式下仍会报**：`--profile docs-site` 只关掉「笔记语义」类检查，frontmatter 的 title/H1 一致性照旧——文档站页面若 H1 与 title 不一致，要么改 `title` 要么忽略这条 WARN。
 - **正文是否被动过，现在有两道取证**：`roundtrip_check.py`（逐篇连续子序列）和 git `rename` 相似度。 `rename` 相似度、整体回滚都依赖 git；库不在版本控制里时，先 `git init` 并提交一次基线，再让 agent 动手。
 - **平台坑主要是 Windows 的**（沙箱写入需提权、PowerShell 变量大小写不敏感、`Select-Object -First` 掐断上游管道、UTF-8 需无 BOM）。校验器本身跨平台，用 Python 3 标准库，无第三方依赖。
 
@@ -242,6 +256,7 @@ python tests/run_eval.py           # 可加 --verbose 看子进程原始输出
 - 改了 frontmatter 字段或目录结构，必须同步改 `scripts/validate_vault.py` 里的 `REQUIRED_FIELDS` / `DIR_TYPE` / `VALID_TYPES`，否则会误报；改完跑 `python tests/run_eval.py`。
 - 新增/删除校验规则 id 时，`tests/run_eval.py` 里的预期规则集合要跟着改（断言是 SUPERSET，新增规则不会误伤，删规则会 FAIL）。
 - `README.md` 和 `SKILL.md` 描述的是同一个东西，改流程时两边都要动，别只改一边。
+- 新增/修改判定语义（比如新的剥离规则、新 profile）时，同步加一条 `tests/fixtures/` 用例——现在 40 项断言覆盖校验器、往返检查、盘点三个脚本，改坏任意一个都会被抓住。
 - `SKILL.md` 的 `description` 只写「何时触发」，不要写流程摘要——实测把流程写进描述会让 agent 跳过正文直接干。
 - 新增平台坑时写进 SKILL.md 的「平台坑」一节，并注明是哪个平台实测的，不要凭想象补。
 

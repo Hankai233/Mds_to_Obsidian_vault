@@ -41,7 +41,7 @@ license: MIT
 
 **先判仓库还是笔记库，再决定要不要搬。** `inventory.py` 报 `code-repo` / `docs-site` / `mixed` 时，先看这两条：
 
-- **`docs-site`**（有 `mkdocs.yml` / `_sidebar.md` / VuePress、Docusaurus 配置）：目录本身就是导航，路径被配置硬编码。**不要套 `00_`/`10_` 骨架，不要搬文件改名**，否则站点直接 404。只做三件事：给笔记类 md 补 frontmatter、修真实死链、在现有目录下补一篇 MOC 索引。用户坚持重组时，先改导航配置再搬文件，并把被导航引用的路径逐条列进映射表。
+- **`docs-site`**（有 `mkdocs.yml` / `_sidebar.md` / VuePress、Docusaurus 配置）：目录本身就是导航，路径被配置硬编码。**不要套 `00_`/`10_` 骨架，不要搬文件改名**，否则站点直接 404。只做三件事：给笔记类 md 补 frontmatter、修真实死链、清掉明显的空文件与重复页。**页面之间不需要互链**，所以校验要加 `--profile docs-site`（跳过 `no-outbound` / `one-outbound` / `orphan` / `not-indexed-by-moc` / `root-note` 这些笔记语义检查；死链、frontmatter、重名照旧检查）。用户坚持重组时，先改导航配置再搬文件，并把被导航引用的路径逐条列进映射表。
 - **`code-repo`**：代码、构建产物、依赖目录（`node_modules`、`dist`、`.venv`）一律不碰；只对 `docs/`、`*.md` 说明文件按笔记规则处理。
 
 `move_blocked` 里列出的路径，就是「搬了会坏」的清单。
@@ -116,13 +116,15 @@ _attachments/ 附件（图片/PDF/表格）
 ### 5. 校验 → 安装 → 提交
 
 ```bash
-python scripts/validate_vault.py <vault_root>
+python scripts/validate_vault.py <vault_root>                        # 笔记库
+python scripts/validate_vault.py <vault_root> --profile docs-site    # 文档站
 ```
 
-必须 **0 错误**才能进下一步。拆分过的库再跑一次往返检查，逐篇证明正文没被动过：
+必须 **0 错误**才能进下一步。文档站不要为了消 `no-outbound` 硬塞 `## 相关` 链接——那不是文档站的形状，用 `--profile docs-site` 才是对的。拆分过的库再跑一次往返检查，逐篇证明正文没被动过：
 
 ```bash
-python scripts/roundtrip_check.py <vault_root>
+python scripts/roundtrip_check.py <vault_root>                  # 默认：未覆盖记 WARN
+python scripts/roundtrip_check.py <vault_root> --require-full   # 严格：有子笔记就必须逐行覆盖
 ```
 
 它要求每篇拆出来的笔记，正文必须是 `30_Sources/` 存档正文的**连续子序列**（允许整段少，不允许改一个字），标题只允许降级一级。退出码非 0 就是有人「顺手改好了」。这比 `git rename` 相似度强：相似度只能证明原件进了存档，证明不了拆出来的每一篇没被改写。
@@ -172,6 +174,12 @@ python scripts/roundtrip_check.py <vault_root>
 - 全路径双链（`[[notes/a/Guide]]`）与带 `<尖括号>`/`%20` 的 markdown 链接都按真实路径解析
 - `--json` 输出可被程序解析（`errors` / `warnings` / `code_anchors` / `exit_code`），`--max-errors N` 调文本模式的上限（JSON 永不截断）
 - `fence-unclosed` 说明有围栏没闭合，其后内容被当成代码、链接检查已跳过——先补围栏再看链接结论
+- **注释、行内代码、缩进代码块里的 `[[X]]` 不是链接**（`%%...%%`、`<!-- -->`、行内 `` `...` ``、空行后 4 空格缩进）。这些是写给人的，不要为了清零错误去改，校验器也不会报
+- **逃出 vault 的相对链接**：指向源码树（`../src/...`、`Foo.java:12`）记为「代码仓库锚点」，不算错误；目标存在但不是代码 → `WARN outside-link`；目标不存在 → `ERROR broken-relative-link`
+- `roundtrip_check.py --require-full`：只要存档拆出了子笔记，就必须逐行覆盖，有未覆盖行直接 exit 1。默认模式不因未覆盖失败（存档保留全书，覆盖不全可能是正常取舍）
+- **一篇笔记正文最多一个 H1**。拆分时原文的第一个 H1 归第一篇；后续篇章从 `##` 起，不要为了让每篇「看起来完整」各补一个 H1。原文 frontmatter 之前的说明段同样只归第一篇
+- **重名与大小写**：全库 `basename` 重名报 `dup-stem`（`[[X]]` 会歧义）；双链解析**大小写敏感**，按 Linux 语义判，`[[guide]]` 不会匹配 `Guide.md`
+- `status` 只取 `seed` / `growing` / `evergreen`，`confidence` 只取 `high` / `medium` / `low`；`evergreen` 必须有入链，否则 WARN
 - 退出码：`0` 无错误（警告允许）· `1` 有错误 · `2` 用法错误
 
 ## 平台坑（都是踩过的）

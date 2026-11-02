@@ -11,11 +11,16 @@ What it reports:
   * one summary line per md file: lines, bytes, mtime, frontmatter, first H1,
     `##` count, `## N.` split units, outbound wikilinks, embeds, table, code
     block, BOM, CRLF
-  * split candidates ranked by `## N.` count (one section = one note)
+  * split candidates ranked by `## N.` count (one section = one note); a file
+    under 40 lines, or whose every section has under 8 body lines, is listed
+    as too short to split and kept out of the main list
   * suspected duplicates: same basename, same normalised first 2 KB, same
     byte size + same title
-  * dead-link pre-scan, with links into a source tree reported separately as
-    "code anchors" (never dead links)
+  * dead-link pre-scan using the same case-sensitive resolution as
+    validate_vault.py; case-only mismatches (`[[guide]]` vs `Guide.md`) are
+    reported separately, and links into a source tree are reported as
+    "code anchors" (never dead links). Links inside `%%...%%` comments,
+    `<!-- ... -->` comments and indented code blocks are not links.
   * attachment inventory, orphan attachments, duplicate attachments
   * project kind: notes-vault / code-repo / docs-site / mixed, plus paths that
     a build system references (move-blocked candidates)
@@ -49,6 +54,10 @@ DEFAULT_MAX_FILES = 5000
 DEEP_DEPTH = 6
 MAX_ANALYZE_BYTES = 8 * 1024 * 1024
 TEXT_SCAN_BYTES = 2 * 1024 * 1024
+# SKILL.md: a subsection needs at least 8 body lines to be worth its own note,
+# and a file shorter than 40 lines is not worth splitting at all.
+MIN_SECTION_BODY_LINES = 8
+MIN_SPLIT_FILE_LINES = 40
 BOM = b"\xef\xbb\xbf"
 
 # Directories that are never part of the note inventory. `.obsidian` is read
@@ -112,6 +121,14 @@ WIKI_RE = re.compile(r"(!?)\[\[([^\[\]\n]+?)\]\]")
 MD_LINK_RE = re.compile(r"(!?)\[([^\]\n]*)\]\(\s*<?([^)\s>]+)>?")
 CODE_FENCE_RE = re.compile(r"^[ \t]*(```|~~~)", re.M)
 INDENT_CODE_RE = re.compile(r"^(?: {4}|\t)\S", re.M)
+# Text that only looks like a link: Obsidian comments, HTML comments and
+# indented code blocks. They are blanked before links are scanned.
+OBSIDIAN_COMMENT_RE = re.compile(r"%%.*?%%|<!--.*?-->", re.S)
+# 行内代码里的 [[X]] 不是链接（与 validate_vault.py 同一口径）
+INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+INDENT_CODE_START_RE = re.compile(r"^(?: {4,}|\t)")
+LIST_MARKER_RE = re.compile(r"^(?:[-*+][ \t]|\d+[.)][ \t])")
+HEADING_LINE_RE = re.compile(r"^#{1,6}(?:[ \t]|$)")
 TABLE_SEP_RE = re.compile(r"^\|?[ \t]*:?-{2,}")
 WS_RE = re.compile(r"\s+")
 
@@ -305,6 +322,76 @@ def strip_fences(text):
     return "".join(out), fence_char is not None
 
 
+def blank_keep_lines(text):
+    """Replace every non-newline character with a space, keeping line count."""
+    return "".join(
+        "\n" if ch == "\n" else ("\r" if ch == "\r" else " ")
+        for ch in text
+    )
+
+
+def strip_comments(text):
+    """Blank `%%...%%` / `<!-- ... -->` comments and inline code spans.
+
+    Blanking (instead of deleting) keeps every link on its original line, and
+    a `[[...]]` inside a comment or inline code no longer looks like a link:
+    notes are written for humans, nobody should rewrite them to clear warnings.
+    """
+    text = INLINE_CODE_RE.sub(lambda match: blank_keep_lines(match.group(0)), text)
+    return OBSIDIAN_COMMENT_RE.sub(lambda match: blank_keep_lines(match.group(0)), text)
+
+
+def strip_indented_code(text):
+    """Blank indented code blocks (>=4 spaces or a tab), keeping line count.
+
+    A block only starts on an indented line that follows a blank line and whose
+    content is not a list item, blockquote or table row; it ends at the next
+    blank line. The guard is deliberately conservative so links in nested
+    lists (e.g. `    - [[x]]`) are never stripped.
+    """
+    out = []
+    in_code = False
+    prev_blank = True
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        content = body.lstrip(" \t")
+        if in_code:
+            if content:
+                out.append(" " * len(body) + ending)
+                prev_blank = False
+            else:
+                in_code = False
+                out.append(line)
+                prev_blank = True
+            continue
+        if not content:
+            out.append(line)
+            prev_blank = True
+            continue
+        if (
+            prev_blank
+            and INDENT_CODE_START_RE.match(body)
+            and not (
+                LIST_MARKER_RE.match(content)
+                or content.startswith(">")
+                or content.startswith("|")
+            )
+        ):
+            in_code = True
+            out.append(" " * len(body) + ending)
+            prev_blank = False
+            continue
+        out.append(line)
+        prev_blank = False
+    return "".join(out)
+
+
+def strip_link_noise(text):
+    """Remove everything that looks like a link but is not one."""
+    return strip_indented_code(strip_comments(text))
+
+
 def parse_frontmatter_fields(text):
     match = FRONTMATTER_RE.match(text)
     if not match:
@@ -423,22 +510,39 @@ def enumerate_files(root):
 
 
 def build_indexes(files, root):
-    rel_index = {}
+    """Build case-sensitive indexes, plus casefolded ones for diagnostics.
+
+    The case-sensitive tables must mirror scripts/validate_vault.py, which keys
+    its indexes by the literal `p.stem` / relative path. A casefolded lookup
+    here would resolve [[guide]] to Guide.md and hide a link the validator
+    reports as broken-wikilink.
+    """
+    rel_path = {}
     stem_index = {}
     name_index = {}
+    fold_rel = {}
+    fold_stem = {}
+    fold_name = {}
     for info in files:
-        rel_index[info.rel.casefold()] = info.rel
+        rel_path[info.rel] = info.rel
+        fold_rel.setdefault(info.rel.casefold(), []).append(info.rel)
         if info.is_md:
-            stem_index.setdefault(Path(info.name).stem.casefold(), []).append(info.rel)
-        name_index.setdefault(info.name.casefold(), []).append(info.rel)
-    for table in (stem_index, name_index):
+            stem = Path(info.name).stem
+            stem_index.setdefault(stem, []).append(info.rel)
+            fold_stem.setdefault(stem.casefold(), []).append(info.rel)
+        name_index.setdefault(info.name, []).append(info.rel)
+        fold_name.setdefault(info.name.casefold(), []).append(info.rel)
+    for table in (stem_index, name_index, fold_rel, fold_stem, fold_name):
         for key in table:
             table[key].sort()
     return {
         "root": root,
-        "rel_index": rel_index,
+        "rel_path": rel_path,
         "stem_index": stem_index,
         "name_index": name_index,
+        "fold_rel": fold_rel,
+        "fold_stem": fold_stem,
+        "fold_name": fold_name,
     }
 
 
@@ -453,20 +557,52 @@ def resolve_wiki(target, md_rel, ctx):
         variants.append(target + ".md")
     base_dir = posixpath.dirname(md_rel)
     for variant in variants:
-        key = variant.casefold()
-        if key in ctx["rel_index"]:
-            return ctx["rel_index"][key]
+        if variant in ctx["rel_path"]:
+            return ctx["rel_path"][variant]
         joined = posixpath.normpath(posixpath.join(base_dir, variant))
-        if joined.casefold() in ctx["rel_index"]:
-            return ctx["rel_index"][joined.casefold()]
+        if joined in ctx["rel_path"]:
+            return ctx["rel_path"][joined]
     base = posixpath.basename(target)
     if not suffix:
-        matches = ctx["stem_index"].get(base.casefold())
+        matches = ctx["stem_index"].get(base)
         if matches:
             return matches[0]
-    matches = ctx["name_index"].get(base.casefold())
+    matches = ctx["name_index"].get(base)
     if matches:
         return matches[0]
+    return None
+
+
+def resolve_wiki_casefold(target, md_rel, ctx):
+    """Return one existing file that matches only when case is ignored.
+
+    Used after resolve_wiki() failed: if ignoring case yields exactly one file,
+    the link is a case mismatch (broken for the validator, openable on Windows)
+    rather than a dead link. Ambiguous matches return None on purpose.
+    """
+    target = target.replace("\\", "/").strip().strip("/")
+    if not target:
+        return None
+    target = urllib.parse.unquote(target)
+    suffix = posixpath.splitext(target)[1].lower()
+    variants = [target]
+    if not suffix:
+        variants.append(target + ".md")
+    base_dir = posixpath.dirname(md_rel)
+    hits = []
+    for variant in variants:
+        hits.extend(ctx["fold_rel"].get(variant.casefold(), ()))
+        joined = posixpath.normpath(posixpath.join(base_dir, variant))
+        hits.extend(ctx["fold_rel"].get(joined.casefold(), ()))
+    if not hits:
+        base = posixpath.basename(target)
+        if not suffix:
+            hits.extend(ctx["fold_stem"].get(base.casefold(), ()))
+        if not hits:
+            hits.extend(ctx["fold_name"].get(base.casefold(), ()))
+    unique = sorted(set(hits))
+    if len(unique) == 1:
+        return unique[0]
     return None
 
 
@@ -505,9 +641,11 @@ def resolve_relative(root, md_rel, raw):
 
 def scan_links(text, md_rel, ctx):
     dead = []
+    case_mismatches = []
     anchors = set()
     refs = set()
     seen = set()
+    seen_case = set()
 
     def add_dead(target, kind):
         key = (md_rel, target, kind)
@@ -515,6 +653,15 @@ def scan_links(text, md_rel, ctx):
             return
         seen.add(key)
         dead.append({"path": md_rel, "target": target, "kind": kind})
+
+    def add_case_mismatch(target, actual):
+        key = (md_rel, target, actual)
+        if key in seen_case:
+            return
+        seen_case.add(key)
+        case_mismatches.append({
+            "path": md_rel, "target": target, "actual": actual,
+        })
 
     for match in WIKI_RE.finditer(text):
         is_embed = bool(match.group(1))
@@ -525,6 +672,10 @@ def scan_links(text, md_rel, ctx):
         if resolved:
             if not is_md_rel(resolved):
                 refs.add(resolved)
+            continue
+        actual = resolve_wiki_casefold(target, md_rel, ctx)
+        if actual:
+            add_case_mismatch(target, actual)
             continue
         if looks_like_code(target):
             anchors.add((md_rel, target))
@@ -552,7 +703,29 @@ def scan_links(text, md_rel, ctx):
             continue
         add_dead(raw.strip(), "embed" if is_embed else "relative")
 
-    return dead, anchors, refs
+    return dead, anchors, refs, case_mismatches
+
+
+def split_section_lengths(text):
+    """Count body lines per `## N.` section, excluding headings and blanks."""
+    counts = []
+    current = None
+    for line in text.splitlines():
+        if SPLIT_RE.match(line):
+            if current is not None:
+                counts.append(current)
+            current = 0
+            continue
+        if current is None:
+            continue
+        if not line.strip():
+            continue
+        if HEADING_LINE_RE.match(line.lstrip(" \t")):
+            continue
+        current += 1
+    if current is not None:
+        counts.append(current)
+    return counts
 
 
 def analyze_md(info, ctx):
@@ -568,6 +741,10 @@ def analyze_md(info, ctx):
     body = FRONTMATTER_RE.sub("", text, count=1) if has_fm else text
     stripped_full, fence_unclosed = strip_fences(text)
     body_stripped, _ = strip_fences(body)
+    # Comments and indented code are not links: blank them before scanning,
+    # on both the full text (dead links) and the body (outbound counts).
+    scan_text = strip_link_noise(stripped_full)
+    body_links = strip_link_noise(body_stripped)
 
     h1 = None
     heading = H1_RE.search(body_stripped)
@@ -580,21 +757,23 @@ def analyze_md(info, ctx):
 
     wiki_out = 0
     embeds = 0
-    for match in WIKI_RE.finditer(body_stripped):
+    for match in WIKI_RE.finditer(body_links):
         if match.group(1):
             embeds += 1
         else:
             wiki_out += 1
-    for match in MD_LINK_RE.finditer(body_stripped):
+    for match in MD_LINK_RE.finditer(body_links):
         if match.group(1):
             embeds += 1
 
-    dead, anchors, refs = scan_links(stripped_full, info.rel, ctx)
+    dead, anchors, refs, case_mismatches = scan_links(scan_text, info.rel, ctx)
 
     normalised = WS_RE.sub(" ", body).strip()
     content_hash = None
     if normalised:
         content_hash = hashlib.sha256(normalised[:2048].encode("utf-8")).hexdigest()
+
+    section_lengths = split_section_lengths(body_stripped) if split_units else []
 
     obj = {
         "path": info.rel,
@@ -616,7 +795,7 @@ def analyze_md(info, ctx):
         "depth": info.depth,
         "truncated": truncated,
     }
-    return obj, dead, anchors, refs, content_hash
+    return obj, dead, anchors, refs, case_mismatches, content_hash, section_lengths
 
 
 # ---------------------------------------------------------------------------
@@ -977,7 +1156,9 @@ def build_inventory(root, top, max_files):
     md_total = sum(1 for info in files if info.is_md)
     md_objs = []
     split_candidates = []
+    split_too_small = []
     dead_links = []
+    case_mismatches = []
     anchors = set()
     refs = set()
     content_groups = {}
@@ -987,7 +1168,10 @@ def build_inventory(root, top, max_files):
 
     for info in deep:
         if info.is_md:
-            obj, dead, found_anchors, found_refs, content_hash = analyze_md(info, ctx)
+            (
+                obj, dead, found_anchors, found_refs, found_mismatches,
+                content_hash, section_lengths,
+            ) = analyze_md(info, ctx)
             md_objs.append(obj)
             if obj["split_units"] > 0:
                 suggested = (
@@ -995,13 +1179,33 @@ def build_inventory(root, top, max_files):
                     if obj["lines"] >= 150 and obj["split_units"] >= 2
                     else 1
                 )
-                split_candidates.append({
+                entry = {
                     "path": obj["path"],
                     "lines": obj["lines"],
                     "split_units": obj["split_units"],
                     "suggested_parts": suggested,
-                })
+                }
+                average = (
+                    round(float(sum(section_lengths)) / len(section_lengths), 1)
+                    if section_lengths else 0
+                )
+                too_short = (
+                    obj["lines"] < MIN_SPLIT_FILE_LINES
+                    or (
+                        section_lengths
+                        and all(
+                            count < MIN_SECTION_BODY_LINES
+                            for count in section_lengths
+                        )
+                    )
+                )
+                if too_short:
+                    entry["reason"] = "过短，不建议拆（小节平均 %g 行）" % average
+                    split_too_small.append(entry)
+                else:
+                    split_candidates.append(entry)
             dead_links.extend(dead)
+            case_mismatches.extend(found_mismatches)
             anchors |= found_anchors
             refs |= found_refs
             if content_hash:
@@ -1024,6 +1228,9 @@ def build_inventory(root, top, max_files):
 
     md_objs.sort(key=lambda obj: obj["path"])
     split_candidates.sort(
+        key=lambda item: (-item["split_units"], -item["lines"], item["path"])
+    )
+    split_too_small.sort(
         key=lambda item: (-item["split_units"], -item["lines"], item["path"])
     )
 
@@ -1124,6 +1331,11 @@ def build_inventory(root, top, max_files):
         (item["path"], item["target"], item["kind"]): item
         for item in dead_links
     }.values())
+    case_mismatches = list({
+        (item["path"], item["target"], item["actual"]): item
+        for item in case_mismatches
+    }.values())
+    case_mismatches.sort(key=lambda item: (item["path"], item["target"]))
     anchor_examples = [
         "%s -> %s" % (path, target)
         for path, target in sorted(anchors)[:top]
@@ -1190,6 +1402,7 @@ def build_inventory(root, top, max_files):
         "md": md_objs,
         "dirs": dirs,
         "split_candidates": split_candidates[:top],
+        "split_too_small": split_too_small[:top],
         "big_files": big_files,
         "duplicates": {
             "by_stem": by_stem,
@@ -1197,6 +1410,7 @@ def build_inventory(root, top, max_files):
             "by_size_title": by_size_title,
         },
         "dead_links": dead_links,
+        "case_mismatch": case_mismatches,
         "code_anchors": {
             "count": len(anchors),
             "examples": anchor_examples,
@@ -1453,6 +1667,18 @@ def build_human(data, top):
         lines.extend(render_table(["路径", "行", "切分", "建议"], split_rows, [36, 6, 4, 4]))
     else:
         lines.append("（没有发现 `## N.` 形式的切分单位）")
+    too_small = data.get("split_too_small") or []
+    if too_small:
+        lines.append("过短，不建议拆（不计入主榜）：")
+        for item in too_small[:max(1, min(top, 5))]:
+            lines.append(
+                "  %s（%d 行）%s" % (
+                    fit_tail(item["path"], 40), item["lines"],
+                    item.get("reason", ""),
+                )
+            )
+        if len(too_small) > 5:
+            lines.append("  ... 另有 %d 个" % (len(too_small) - 5))
 
     # 5. duplicates
     duplicates = data["duplicates"]
@@ -1527,11 +1753,31 @@ def build_human(data, top):
         if len(data["fence_unclosed"]) > 3:
             lines.append("  ... 另有 %d 个" % (len(data["fence_unclosed"]) - 3))
 
-    # 7. attachments
+    # 7. case mismatch
+    mismatches = data.get("case_mismatch") or []
+    lines.append("")
+    lines.append(
+        "## 7. 大小写不一致（%d 处；校验器会判 broken-wikilink，"
+        "Obsidian 在 Windows 上能打开——跨平台库必须改成一致）" % len(mismatches)
+    )
+    if mismatches:
+        for item in mismatches[:max(1, min(top, 6))]:
+            lines.append(
+                "  %s -> %s（实际 %s）" % (
+                    fit_tail(item["path"], 34), fit(item["target"], 30),
+                    fit(item["actual"], 34),
+                )
+            )
+        if len(mismatches) > 6:
+            lines.append("  ... 还有 %d 处" % (len(mismatches) - 6))
+    else:
+        lines.append("  未发现大小写不一致")
+
+    # 8. attachments
     attachments = data["attachments"]
     lines.append("")
     lines.append(
-        "## 7. 附件（%d 个 / %s）" % (
+        "## 8. 附件（%d 个 / %s）" % (
             attachments["attachment_total"], human_size(attachments["attachment_bytes"]),
         )
     )
@@ -1563,10 +1809,10 @@ def build_human(data, top):
     for item in attachments["duplicates"][:max(1, min(top, 3))]:
         lines.append("  " + "  =  ".join(item["paths"]))
 
-    # 8. project
+    # 9. project
     lines.append("")
     lines.append(
-        "## 8. 工程类型（%s，%d 个标志）" % (
+        "## 9. 工程类型（%s，%d 个标志）" % (
             data["project_kind"], len(data["build_systems"]),
         )
     )
@@ -1605,11 +1851,11 @@ def build_human(data, top):
     else:
         lines.append("移动禁区：无（未解析到 nav / docs_dir 引用）")
 
-    # 9. hygiene
+    # 10. hygiene
     hygiene = data["hygiene"]
     lines.append("")
     lines.append(
-        "## 9. 卫生（BOM %d / CRLF %d / 空 %d / 空格名 %d / 深路径 %d / 可疑命名 %d）" % (
+        "## 10. 卫生（BOM %d / CRLF %d / 空 %d / 空格名 %d / 深路径 %d / 可疑命名 %d）" % (
             len(hygiene["bom"]), len(hygiene["crlf"]), len(hygiene["empty"]),
             len(hygiene["space_names"]), len(hygiene["deep"]),
             len(hygiene["suspicious_names"]),
@@ -1640,9 +1886,9 @@ def build_human(data, top):
     else:
         lines.append("附件目录设置：未发现 .obsidian/app.json")
 
-    # 10. recommendations
+    # 11. recommendations
     lines.append("")
-    lines.append("## 10. 建议的下一步（%d 条）" % len(data["recommendations"]))
+    lines.append("## 11. 建议的下一步（%d 条）" % len(data["recommendations"]))
     for index, text in enumerate(data["recommendations"], 1):
         lines.append("%d. %s" % (index, text))
 

@@ -1,0 +1,4 @@
+site_name: 回归文档站
+nav:
+  - 首页: index.md
+  - 指南: guide.md

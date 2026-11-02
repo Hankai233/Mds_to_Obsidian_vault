@@ -7,7 +7,8 @@
 
 用法：
     python scripts/roundtrip_check.py <vault_root>
-        [--source-dir 30_Sources] [--allow-added "相关,延伸问题"] [--json] [--max-report N]
+        [--source-dir 30_Sources] [--allow-added "相关,延伸问题"] [--require-full]
+        [--json] [--max-report N]
 
 判定规则（只读，不改任何文件）：
 
@@ -19,27 +20,37 @@
      子笔记的每个标题文本要能在存档里找到同名标题，且「子 = 存档 − 1」级；
      存档是 1 级时允许子也是 1 级（保留一级标题）。
 
-  C. 覆盖率（WARN，不影响退出码）
-     存档正文行被所有子笔记覆盖的比例；未覆盖行列出来由人判断。允许「只拆
-     一部分」（存档保留全书是正常的），但必须报出来。
+  C. 覆盖率（默认 WARN，不影响退出码；加 `--require-full` 才是 ERROR）
+     存档正文行被所有子笔记覆盖的比例；未覆盖行列出来由人判断。**默认不因
+     未覆盖判失败，因为存档保留全书**——只拆其中一部分是合法用法，所以默认
+     只打 WARN，退出码保持 0。要严格比对（有子笔记的存档必须逐行全覆盖）
+     就加 `--require-full`：任何未覆盖的 core line 都判 ERROR 并 exit 1。
+     没有任何子笔记的存档不受严格模式约束（还没拆，不算漏）。
 
   D. `source` 指向不存在的笔记 → ERROR `source-broken`。
 
-退出码：0 = 全部通过，1 = 发现差异/丢失，2 = 用法错误。
+退出码：0 = 全部通过，1 = 发现差异/丢失（或 `--require-full` 下有未覆盖行），
+2 = 用法错误 / 内置自检失败。
 
 JSON（`--json` 时 stdout 只有 JSON）：`vault` / `sources` / `issues` /
-`unlinked_notes` / `exit_code`。每个 source 有 `path` / `core_lines` /
-`children` / `coverage`；每个 child 有 `path` / `ok` / `match` / `issues`；
-每个 issue 有 `rule` / `detail` / `archive_line` / `note_line` /
-`archive_text` / `note_text`。
+`unlinked_notes` / `require_full` / `uncovered_lines` / `exit_code`。
+`require_full` 是本次是否开了严格覆盖；`uncovered_lines` 是「有子笔记的
+存档」里未覆盖正文行的总数（没有未覆盖则为 0），也是 `--require-full`
+判失败的依据。每个 source 有 `path` / `core_lines` / `children` /
+`coverage`；每个 child 有 `path` / `ok` / `match` / `issues`；每个 issue 有
+`rule` / `detail` / `archive_line` / `note_line` / `archive_text` / `note_text`。
 
 行号语义（别混用）：`rewritten` 的 `archive_line` / `note_line` 是**正文行
 序号**（1 起，标题与空行不算），负数/None 表示对不到；标题类 issue 的
 `note_line` 是标题在笔记文件里的**物理行号**，`archive_line` 为 null。
 
 已知取舍（也写在汇报里）：
-- 标题比对会先去掉前导编号（`1. ` / `第 3 章` / `(2)`）与首尾冒号，所以
-  `# 会话持久化` 能对上存档的 `## 1. 会话持久化`；除此之外必须同名。
+- 标题比对先试「去前导编号」（`1. ` / `第3章` / `(2)`）与首尾冒号后的结果，
+  再试原始文本，任一相等即通过，所以 `# 会话持久化` 能对上存档的
+  `## 1. 会话持久化`；除此之外必须同名。归一化把整段吃空时（如 `第三节`
+  整句就是编号）回退用原始标题，绝不拿空串去比。
+- `第 3 节` 与 `第三 节` 这类纯数字/中文数字写法差异不要求判等（会报
+  `heading-not-in-source`，但报错信息里显示真实标题）。
 - 只匹配第一处完全相同的连续片段；正文里有大段完全重复的章节时可能定位到
   较早的那一处（内容等价，行号可能偏前）。
 - 子笔记正文为空（只有标题 / 只有 `--allow-added` 小节）判 `rewritten` 失败，
@@ -149,13 +160,59 @@ def source_target(fm):
 
 
 def norm_heading(text):
-    """标题比对用的归一化：去围栏尾 #、去前导编号、去首尾冒号、压空白。"""
-    value = (text or "").strip()
-    value = TRAILING_HASH_RE.sub("", value).strip()
+    """标题比对用的归一化：去围栏尾 #、去前导编号、去首尾冒号、压空白。
+
+    归一化把整段吃空时（`第三节` / `第3节` 整个标题就是编号）回退用原始
+    标题——绝不返回空串，否则报错信息里是空白，比对也失衡。
+    """
+    raw = WS_RE.sub(" ", (text or "").strip())
+    value = TRAILING_HASH_RE.sub("", raw).strip()
     value = NUMBERING_RE.sub("", value).strip()
     value = value.strip(":：").strip()
     value = WS_RE.sub(" ", value)
-    return value
+    return value or raw.strip(":：").strip() or raw
+
+
+def heading_keys(text):
+    """标题同名的判定键：归一化结果 + 原始文本，去空去重。
+
+    任一相等即视为同名。归一化已保证非空（回退原文），这里再挡一次空串。
+    """
+    keys = []
+    for key in (norm_heading(text), WS_RE.sub(" ", (text or "").strip())):
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def self_check():
+    """内置自检：标题归一化不能把纯编号标题吃成空串。
+
+    历史 bug：`第三节` / `第3节` 被 NUMBERING_RE 整段吃掉返回 ''，
+    于是子笔记 `# 第三节` 与存档比对时报「存档里没有同名标题（去编号后
+    比对 ``）」，信息是空白。返回失败说明列表（空列表 = 通过）。
+    """
+    cases = (
+        ("第三节", "第三节"),
+        ("第3节", "第3节"),
+        ("第三 节", "第三 节"),
+        ("第 3 节", "第 3 节"),
+        ("第三节:", "第三节"),
+        ("3. 冒泡排序", "冒泡排序"),
+        ("（2）快速排序", "快速排序"),
+        ("冒泡排序", "冒泡排序"),
+    )
+    failures = []
+    for raw, want in cases:
+        got = norm_heading(raw)
+        if got != want:
+            failures.append(f"norm_heading({raw!r}) == {got!r}，期望 {want!r}")
+    for raw in ("第三节", "第3节", "第 3 节", "第三节:"):
+        if not norm_heading(raw):
+            failures.append(f"norm_heading({raw!r}) 返回空串（应回退原始标题）")
+    if not heading_keys("第三节"):
+        failures.append("heading_keys('第三节') 为空（标题比对键丢失）")
+    return failures
 
 
 def level_ok(note_level, archive_level):
@@ -332,16 +389,24 @@ def check_headings(note_headings, archive_headings):
     issues = []
     index = {}
     for level, text, _lineno in archive_headings:
-        index.setdefault(norm_heading(text), []).append((level, text))
+        for key in heading_keys(text):
+            index.setdefault(key, []).append((level, text))
 
     for level, text, lineno in note_headings:
-        key = norm_heading(text)
+        keys = heading_keys(text)
         note_md = f"{'#' * level} {text}".strip()
-        candidates = index.get(key)
+        candidates = []
+        for key in keys:
+            for item in index.get(key, ()):
+                if item not in candidates:
+                    candidates.append(item)
         if not candidates:
+            # 归一化为空时 norm_heading 已回退原文，这里 keys 不会含空串；
+            # 报错信息里必须是真实标题，不能是 ``
+            shown = "、".join(f"`{key}`" for key in keys) or f"`{text.strip()}`"
             issues.append({
                 "rule": "heading-not-in-source",
-                "detail": f"存档里没有同名标题（去编号后比对 `{key}`）",
+                "detail": f"存档里没有同名标题（笔记 `{note_md}`，比对用 {shown}）",
                 "archive_line": None,
                 "note_line": lineno,
                 "archive_text": "",
@@ -423,7 +488,7 @@ def resolve_target(target, by_stem, source_dir):
 
 # ---------------------------------------------------------------- 主检查
 
-def check(vault, source_dir, allow_added, max_report):
+def check(vault, source_dir, allow_added, max_report, require_full=False):
     notes = load_notes(vault)
     by_stem = {}
     for note in notes:
@@ -461,6 +526,8 @@ def check(vault, source_dir, allow_added, max_report):
 
     sources_out = []
     passed = failed = 0
+    # --require-full 的判定范围：有子笔记的存档里未覆盖的正文行总数
+    strict_gaps = []
 
     for archive in archives:
         a_core, a_headings = extract(archive["tokens"], ())
@@ -514,6 +581,10 @@ def check(vault, source_dir, allow_added, max_report):
         total = len(a_core)
         uncovered = [i for i in range(total) if i not in covered]
         ratio = round(len(covered) / total, 3) if total else 1.0
+        missing = total - len(covered)
+        if kids and missing:
+            # 有子笔记却只覆盖了一部分：默认只是 WARN，--require-full 才算失败
+            strict_gaps.append((archive["rel"], missing))
 
         sources_out.append({
             "path": archive["rel"],
@@ -547,12 +618,18 @@ def check(vault, source_dir, allow_added, max_report):
         "note_text": "",
     } for note_rel, target, kind in broken]
 
-    exit_code = 0 if (failed == 0 and not broken_issues) else 1
+    uncovered_lines = sum(missing for _rel, missing in strict_gaps)
+    require_full_failed = bool(require_full and strict_gaps)
+    exit_code = 0 if (
+        failed == 0 and not broken_issues and not require_full_failed
+    ) else 1
     return {
         "vault": str(vault),
         "sources": sources_out,
         "issues": broken_issues,
         "unlinked_notes": unlinked,
+        "require_full": bool(require_full),
+        "uncovered_lines": uncovered_lines,
         "exit_code": exit_code,
     }
 
@@ -629,9 +706,13 @@ def render(report, max_report, allow_added=DEFAULT_ALLOW_ADDED):
 
         missing = total - coverage["covered"]
         if missing:
-            out.append(
-                f"  未覆盖 {missing} 行（WARN：存档保留全书、允许只拆部分，请自行判断）:"
+            strict = bool(report.get("require_full")) and bool(kids)
+            reason = (
+                "--require-full 要求有子笔记的存档逐行全覆盖"
+                if strict
+                else "存档保留全书、允许只拆部分，请自行判断"
             )
+            out.append(f"  未覆盖 {missing} 行（{'ERROR' if strict else 'WARN'}：{reason}）:")
             for entry in coverage["uncovered"]:
                 out.append(f"    - {entry}")
             if missing > len(coverage["uncovered"]):
@@ -650,6 +731,11 @@ def render(report, max_report, allow_added=DEFAULT_ALLOW_ADDED):
     failed = sum(1 for s in report["sources"] for c in s["children"] if not c["ok"])
     out.append("")
     out.append(f"未关联存档的笔记: {report['unlinked_notes']} 篇")
+    if report.get("require_full") and report.get("uncovered_lines"):
+        out.append(
+            f"严格覆盖（--require-full）: 有子笔记的存档仍有 "
+            f"{report['uncovered_lines']} 行未覆盖 → 判失败"
+        )
     out.append(f"结果: {passed} 通过 / {failed} 失败")
     return "\n".join(out)
 
@@ -672,6 +758,11 @@ def build_parser():
              '传空串表示一个都不允许（这些小节连同内容不参与比对）',
     )
     parser.add_argument("--json", action="store_true", help="stdout 只输出 JSON")
+    parser.add_argument(
+        "--require-full", action="store_true",
+        help="严格覆盖：有子笔记的存档必须被完全覆盖，任何未覆盖正文行都判 ERROR "
+             "并 exit 1（默认不因未覆盖判失败，因为存档保留全书、允许只拆一部分）",
+    )
     parser.add_argument(
         "--max-report", type=int, default=50, metavar="N",
         help="差异/未覆盖行最多列 N 条（默认 50）",
@@ -709,6 +800,13 @@ def main(argv=None):
         except (AttributeError, ValueError):
             pass
 
+    # 内置自检：标题归一化不能把纯编号标题吃成空串（否则报错信息是空白）
+    failures = self_check()
+    if failures:
+        for line in failures:
+            print(f"内置自检失败: {line}", file=sys.stderr)
+        return 2
+
     vault = Path(args.vault_root).expanduser()
     if not vault.is_dir():
         print(f"不是目录: {args.vault_root}", file=sys.stderr)
@@ -739,6 +837,7 @@ def main(argv=None):
         source_dir=source_dir,
         allow_added=allow_added,
         max_report=args.max_report,
+        require_full=args.require_full,
     )
 
     if args.json:

@@ -13,6 +13,11 @@
     messy    杂乱知识库 -> 退出 1，命中预期错误/警告，且两类历史误报不再出现
     split    拆分对照 -> roundtrip_check.py 认可照搬篇、抓住改写篇并定位到行
     urlsrc   source 是外部 URL -> roundtrip_check.py 不得误报 source-broken
+    comments 注释 / 行内代码 / 缩进代码里的 [[X]] 不是链接，不得误报
+    outside  逃出 vault 的相对链接：源码路径记锚点，目标不存在报 broken-relative-link
+    docsite  文档站页面不要求互链：--profile docs-site 下零错误
+    strict   roundtrip --require-full：有子笔记但未全覆盖判失败
+    inventory 大小写不符（[[guide]] vs Guide.md）记 case_mismatch 而非死链
 
 只用标准库。被测脚本若还在并行重写（文件缺失、拒绝参数、输出不可解析），
 这里报 SKIP 并继续跑其余用例，不抛异常、不中断。
@@ -31,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "validate_vault.py"
 ROUNDTRIP_SCRIPT = REPO_ROOT / "scripts" / "roundtrip_check.py"
+INVENTORY_SCRIPT = REPO_ROOT / "scripts" / "inventory.py"
 
 # 单个子进程的超时（秒）：正常几百毫秒，留足余量但不至于卡死
 PROCESS_TIMEOUT = 180
@@ -113,6 +119,7 @@ def rule_set(entries):
 # （`存在的图.png` 是 `不存在的图.png` 的子串，不能直接 in）
 EMBED_TARGET_RE = re.compile(r"!\[\[([^\]\|#]+)")
 WIKILINK_TARGET_RE = re.compile(r"\[\[([^\]\|#]+)")
+MDLINK_TARGET_RE = re.compile(r"->\s*([^\s）)]+)")
 
 
 def errors_about(errors, rule, target_re, expected_target):
@@ -133,20 +140,20 @@ def errors_about(errors, rule, target_re, expected_target):
 # ---------------------------------------------------------------------------
 
 
-def validate_json(vault_root):
+def validate_json(vault_root, extra_args=None):
     """调 validate_vault.py --json，返回 (解析后的 dict, CompletedProcess)。"""
     if not VALIDATE_SCRIPT.exists():
         raise Skip("scripts/validate_vault.py 不存在（并行重写中？）")
-    proc = run_script(
-        [
-            sys.executable,
-            str(VALIDATE_SCRIPT),
-            str(vault_root),
-            "--json",
-            "--max-errors",
-            "200",
-        ]
-    )
+    argv = [
+        sys.executable,
+        str(VALIDATE_SCRIPT),
+        str(vault_root),
+        "--json",
+        "--max-errors",
+        "200",
+    ]
+    argv.extend(extra_args or [])
+    proc = run_script(argv)
     if proc.returncode not in (0, 1, 2):
         raise Skip(
             "validate_vault.py 退出码 {} 不是 0/1/2：{}".format(
@@ -169,20 +176,20 @@ def validate_json(vault_root):
     return data, proc
 
 
-def roundtrip_json(vault_root):
+def roundtrip_json(vault_root, extra_args=None):
     """调 roundtrip_check.py --json，返回 (解析后的 dict, CompletedProcess)。"""
     if not ROUNDTRIP_SCRIPT.exists():
         raise Skip("scripts/roundtrip_check.py 不存在（并行新增中？）")
-    proc = run_script(
-        [
-            sys.executable,
-            str(ROUNDTRIP_SCRIPT),
-            str(vault_root),
-            "--json",
-            "--max-report",
-            "200",
-        ]
-    )
+    argv = [
+        sys.executable,
+        str(ROUNDTRIP_SCRIPT),
+        str(vault_root),
+        "--json",
+        "--max-report",
+        "200",
+    ]
+    argv.extend(extra_args or [])
+    proc = run_script(argv)
     if proc.returncode not in (0, 1, 2):
         raise Skip(
             "roundtrip_check.py 退出码 {} 不是 0/1/2：{}".format(
@@ -468,11 +475,176 @@ def case_urlsrc():
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 用例五：comments —— 注释 / 行内代码 / 缩进代码里的 [[X]] 不是链接
+# ---------------------------------------------------------------------------
+
+
+def case_comments():
+    vault = FIXTURES / "comments"
+    data, proc = validate_json(vault)
+    errors = data.get("errors") or []
+    rules = rule_set(errors)
+    rows = []
+    rows.append(Row("comments", "exit 0", PASS if proc.returncode == 0 else FAIL,
+                    "" if proc.returncode == 0 else brief(proc.stdout)))
+    rows.append(Row("comments", "errors == []", PASS if not errors else FAIL,
+                    "" if not errors else json.dumps(errors[:3], ensure_ascii=False)))
+    rows.append(Row("comments", "不误报 broken-wikilink",
+                    PASS if "broken-wikilink" not in rules else FAIL,
+                    "" if "broken-wikilink" not in rules else json.dumps(errors[:3], ensure_ascii=False)))
+    anchors = [str(a.get("target", "")) for a in (data.get("code_anchors") or [])]
+    has_anchor = any(a.replace("\\", "/").endswith("src/main/java/Example.java")
+                     for a in anchors)
+    rows.append(Row("comments", "源码锚点登记为 code_anchors", PASS if has_anchor else FAIL,
+                    "" if has_anchor else "code_anchors: {}".format(anchors)))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 用例六：outside —— 逃出 vault 的相对链接按「代码锚点 / 坏链」分流
+# ---------------------------------------------------------------------------
+
+
+def case_outside():
+    vault = FIXTURES / "outside"
+    data, proc = validate_json(vault)
+    errors = data.get("errors") or []
+    rows = []
+    rows.append(Row("outside", "exit 1", PASS if proc.returncode == 1 else FAIL,
+                    "exit {}".format(proc.returncode)))
+    broken = errors_about(errors, "broken-relative-link", MDLINK_TARGET_RE, "../outside/nope.md")
+    rows.append(Row("outside", "逃库且不存在的链接报 broken-relative-link",
+                    PASS if broken else FAIL,
+                    "" if broken else json.dumps(errors[:3], ensure_ascii=False)))
+    anchors = [str(a.get("target", "")) for a in (data.get("code_anchors") or [])]
+    has_anchor = any(a.replace("\\", "/").endswith("src/main/java/Example.java")
+                     for a in anchors)
+    rows.append(Row("outside", "源码锚点不报错、记入 code_anchors",
+                    PASS if has_anchor else FAIL,
+                    "" if has_anchor else "code_anchors: {}".format(anchors)))
+    rows.append(Row("outside", "错误只有一条（不重复报）",
+                    PASS if len(errors) == 1 else FAIL,
+                    "errors={}".format(len(errors))))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 用例七：docsite —— 文档站页面不要求互链（--profile docs-site）
+# ---------------------------------------------------------------------------
+
+
+def case_docsite():
+    vault = FIXTURES / "docsite" / "docs"
+    rows = []
+    data_vault, proc_vault = validate_json(vault)
+    vault_rules = rule_set(data_vault.get("errors") or [])
+    rows.append(Row("docsite", "默认模式报 no-outbound", PASS if proc_vault.returncode == 1 and "no-outbound" in vault_rules else FAIL,
+                    "exit {} rules {}".format(proc_vault.returncode, sorted(vault_rules))))
+
+    data_docs, proc_docs = validate_json(vault, ["--profile", "docs-site"])
+    docs_errors = data_docs.get("errors") or []
+    docs_warn_rules = rule_set(data_docs.get("warnings") or [])
+    rows.append(Row("docsite", "docs-site 模式 exit 0", PASS if proc_docs.returncode == 0 else FAIL,
+                    "exit {}".format(proc_docs.returncode)))
+    rows.append(Row("docsite", "docs-site 模式 0 错误", PASS if not docs_errors else FAIL,
+                    "" if not docs_errors else json.dumps(docs_errors[:3], ensure_ascii=False)))
+    noisy = {"no-outbound", "one-outbound", "not-indexed-by-moc", "orphan",
+             "evergreen-no-inbound", "root-note"} & docs_warn_rules
+    rows.append(Row("docsite", "docs-site 模式不再报笔记语义警告", PASS if not noisy else FAIL,
+                    "" if not noisy else "多余警告: {}".format(sorted(noisy))))
+    rows.append(Row("docsite", "JSON 带 profile 字段",
+                    PASS if data_docs.get("profile") == "docs-site" else FAIL,
+                    "profile={!r}".format(data_docs.get("profile"))))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 用例八：strict —— roundtrip_check.py --require-full 有子笔记就必须全覆盖
+# ---------------------------------------------------------------------------
+
+
+def case_strict():
+    vault = FIXTURES / "urlsrc"
+    rows = []
+    data, proc = roundtrip_json(vault, ["--require-full"])
+    rows.append(Row("strict", "--require-full 下未覆盖判失败（exit 1）",
+                    PASS if proc.returncode == 1 else FAIL,
+                    "exit {}".format(proc.returncode)))
+    rows.append(Row("strict", "JSON require_full=true",
+                    PASS if data.get("require_full") is True else FAIL,
+                    "require_full={!r}".format(data.get("require_full"))))
+    uncovered = data.get("uncovered_lines")
+    rows.append(Row("strict", "uncovered_lines 为正整数",
+                    PASS if isinstance(uncovered, int) and uncovered > 0 else FAIL,
+                    "uncovered_lines={!r}".format(uncovered)))
+
+    data_default, proc_default = roundtrip_json(vault)
+    rows.append(Row("strict", "默认模式不因未覆盖判失败",
+                    PASS if proc_default.returncode == 0 else FAIL,
+                    "exit {}".format(proc_default.returncode)))
+    rows.append(Row("strict", "默认模式 require_full=false",
+                    PASS if data_default.get("require_full") is False else FAIL,
+                    "require_full={!r}".format(data_default.get("require_full"))))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 用例九：inventory —— 大小写口径与校验器一致，且区分「大小写不符」与「死链」
+# ---------------------------------------------------------------------------
+
+
+def inventory_json(vault_root, extra_args=None):
+    if not INVENTORY_SCRIPT.exists():
+        raise Skip("scripts/inventory.py 不存在（并行新增中？）")
+    argv = [sys.executable, str(INVENTORY_SCRIPT), str(vault_root), "--json"]
+    argv.extend(extra_args or [])
+    proc = run_script(argv)
+    if proc.returncode != 0:
+        raise Skip("inventory.py 退出码 {}：{}".format(proc.returncode, brief(proc.stderr)))
+    data = parse_json_output(proc.stdout)
+    if not isinstance(data, dict) or "dead_links" not in data:
+        raise Skip("inventory.py --json 输出不可解析或缺少 dead_links")
+    return data
+
+
+def case_inventory():
+    vault = FIXTURES / "casematch"
+    rows = []
+    data = inventory_json(vault)
+    mismatch = data.get("case_mismatch") or []
+    hit = [m for m in mismatch if str(m.get("target")) == "guide"]
+    rows.append(Row("inventory", "case_mismatch 抓到 [[guide]] -> Guide.md",
+                    PASS if hit and "Guide.md" in str(hit[0].get("actual")) else FAIL,
+                    "" if hit else "case_mismatch={}".format(mismatch)))
+    dead_targets = {str(d.get("target")) for d in (data.get("dead_links") or [])}
+    rows.append(Row("inventory", "大小写不符不算死链",
+                    PASS if not (dead_targets & {"guide"}) else FAIL,
+                    "dead={}".format(sorted(dead_targets))))
+
+    data_v, _ = validate_json(vault)
+    broken = [e for e in (data_v.get("errors") or []) if e.get("rule") == "broken-wikilink"]
+    rows.append(Row("inventory", "校验器对同一链接报 broken-wikilink（口径一致）",
+                    PASS if broken else FAIL,
+                    "" if broken else json.dumps(data_v.get("errors"), ensure_ascii=False)))
+
+    keys_ok = all(k in data for k in ("split_too_small", "case_mismatch"))
+    rows.append(Row("inventory", "JSON 新字段存在（split_too_small/case_mismatch）",
+                    PASS if keys_ok else FAIL,
+                    "" if keys_ok else "keys={}".format(sorted(data))))
+    return rows
+
+
 CASES = [
     ("clean", case_clean),
     ("messy", case_messy),
     ("split", case_split),
     ("urlsrc", case_urlsrc),
+    ("comments", case_comments),
+    ("outside", case_outside),
+    ("docsite", case_docsite),
+    ("strict", case_strict),
+    ("inventory", case_inventory),
 ]
 
 
