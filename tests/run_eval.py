@@ -7,7 +7,7 @@
     python3 tests/run_eval.py            # 只打 PASS/FAIL 表
     python3 tests/run_eval.py --verbose  # 额外打印子进程原始输出
 
-用例与固定行为（README.md 第 149-163 行那张对照表的可复跑版本）：
+用例与固定行为（README.md「实测效果」那张对照表的可复跑版本）：
 
     clean    规范知识库 -> validate_vault.py 退出 0，0 错误 0 警告
     messy    杂乱知识库 -> 退出 1，命中预期错误/警告，且两类历史误报不再出现
@@ -18,6 +18,8 @@
     docsite  文档站页面不要求互链：--profile docs-site 下零错误
     strict   roundtrip --require-full：有子笔记但未全覆盖判失败
     inventory 大小写不符（[[guide]] vs Guide.md）记 case_mismatch 而非死链
+    incremental 增量入库的结果态零错误零警告；新笔记自己长出链接并被 MOC 索引；
+             --since 在临时 git 副本上把新增/未跟踪/修改/删除/重命名分对，非 git 目录退出 2
 
 只用标准库。被测脚本若还在并行重写（文件缺失、拒绝参数、输出不可解析），
 这里报 SKIP 并继续跑其余用例，不抛异常、不中断。
@@ -25,9 +27,12 @@
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from collections import namedtuple
 from pathlib import Path
@@ -37,6 +42,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "validate_vault.py"
 ROUNDTRIP_SCRIPT = REPO_ROOT / "scripts" / "roundtrip_check.py"
 INVENTORY_SCRIPT = REPO_ROOT / "scripts" / "inventory.py"
+GIT = shutil.which("git")
 
 # 单个子进程的超时（秒）：正常几百毫秒，留足余量但不至于卡死
 PROCESS_TIMEOUT = 180
@@ -635,6 +641,218 @@ def case_inventory():
     return rows
 
 
+def run_git(args, cwd):
+    """在给定目录跑 git（临时仓库用，不写进被测脚本的调用记录）。"""
+    proc = subprocess.run(
+        [GIT] + list(args),
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=PROCESS_TIMEOUT,
+        encoding="utf-8",
+        errors="replace",
+        env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0"),
+    )
+    RAW_OUTPUT.append(
+        "$ git {cmd}\n[exit {code}]\n--- stdout ---\n{out}\n--- stderr ---\n{err}".format(
+            cmd=" ".join(args), code=proc.returncode, out=proc.stdout, err=proc.stderr,
+        )
+    )
+    return proc
+
+
+def case_incremental():
+    """增量入库：结果态零错误零警告，新笔记自己长出链接并被 MOC 索引。"""
+    vault = FIXTURES / "incremental"
+    rows = []
+
+    data, proc = validate_json(vault)
+    errors = data.get("errors") or []
+    rows.append(Row(
+        "incremental", "增量结果 0 错误",
+        PASS if proc.returncode == 0 and not errors else FAIL,
+        "" if not errors else "；".join(
+            "[{}] {}: {}".format(item.get("rule"), item.get("path"), item.get("message"))
+            for item in errors[:10]) or "exit {}".format(proc.returncode),
+    ))
+    warnings = data.get("warnings") or []
+    rows.append(Row(
+        "incremental", "增量结果 0 警告",
+        PASS if not warnings else FAIL,
+        "" if not warnings else "；".join(
+            "[{}] {}: {}".format(item.get("rule"), item.get("path"), item.get("message"))
+            for item in warnings[:10]),
+    ))
+
+    note = vault / "10_Notes" / "增量入库.md"
+    moc = vault / "20_MOC" / "知识库总览.md"
+    text = note.read_text(encoding="utf-8") if note.exists() else ""
+    body = text.split("---", 2)[-1] if text.startswith("---") else text
+    body_links = set(WIKILINK_TARGET_RE.findall(body))
+    rows.append(Row(
+        "incremental", "新笔记正文 ≥2 条双链",
+        PASS if note.exists() and len(body_links) >= 2 else FAIL,
+        "links={}".format(sorted(body_links)),
+    ))
+    moc_text = moc.read_text(encoding="utf-8") if moc.exists() else ""
+    indexed = "[[增量入库]]" in moc_text
+    rows.append(Row(
+        "incremental", "新笔记被 MOC 索引",
+        PASS if indexed else FAIL,
+        "" if indexed else "MOC 里没有 [[增量入库]]",
+    ))
+    inbox = vault / "00_Inbox"
+    inbox_md = sorted(
+        p.relative_to(vault).as_posix() for p in inbox.rglob("*.md")
+    ) if inbox.is_dir() else []
+    rows.append(Row(
+        "incremental", "00_Inbox 无遗留 md",
+        PASS if not inbox_md else FAIL,
+        "" if not inbox_md else "残留={}".format(inbox_md),
+    ))
+
+    # 不带 --since 时不得凭空出现变更集（旧输出保持原样）
+    plain = inventory_json(vault)
+    rows.append(Row(
+        "incremental", "不带 --since 时 since 为 null",
+        PASS if plain.get("since") is None else FAIL,
+        "since={}".format(brief(json.dumps(plain.get("since"), ensure_ascii=False))),
+    ))
+
+    rows.extend(incremental_since_rows())
+    return rows
+
+
+def incremental_since_rows():
+    """--since：在临时 git 副本上真实提交、改动、改名、删文件，验证分类。"""
+    rows = []
+    vault = FIXTURES / "incremental"
+
+    if GIT is None:
+        rows.append(Row("incremental", "--since 变更集分类", SKIP, "本机没有 git，跳过"))
+        return rows
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        work = Path(temp_dir) / "vault"
+        shutil.copytree(str(vault), str(work))
+
+        def git(*args):
+            proc = run_git(args, work)
+            if proc.returncode != 0:
+                raise RuntimeError("git {} 失败：{}".format(
+                    " ".join(args), brief(proc.stderr) or brief(proc.stdout)))
+            return proc
+
+        try:
+            git("init", "-q")
+            git("config", "user.name", "eval")
+            git("config", "user.email", "eval@local")
+            git("add", "-A")
+            git("-c", "commit.gpgsign=false", "commit", "-q", "-m", "baseline")
+            git("tag", "base")
+
+            new_note = (
+                "---\ntitle: 增量追加\ntype: note\nstatus: seed\n"
+                "tags: [obsidian]\ncreated: 2025-01-13\nupdated: 2025-01-13\n"
+                "source: null\nconfidence: low\n---\n\n# 增量追加\n\n"
+                "## 相关\n\n- [[知识库总览]]：主题入口。\n- [[双链规范]]：挂链写法。\n"
+            )
+            (work / "10_Notes" / "增量追加.md").write_text(new_note, encoding="utf-8")
+            git("add", "10_Notes/增量追加.md")          # -> added（已入索引）
+            (work / "10_Notes" / "未跟踪笔记.md").write_text("# 未跟踪\n", encoding="utf-8")
+            (work / "notes.txt").write_text("plain\n", encoding="utf-8")
+            (work / "assets" / "新图.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            with (work / "10_Notes" / "增量入库.md").open("a", encoding="utf-8") as handle:
+                handle.write("\n补充一行。\n")           # -> modified
+            git("mv", "10_Notes/围栏隔离.md", "10_Notes/围栏隔离改名.md")   # -> renamed
+            (work / "README.md").unlink()               # -> deleted
+        except RuntimeError as exc:
+            rows.append(Row("incremental", "--since 变更集分类", SKIP,
+                            "临时 git 仓库不可用：{}".format(exc)))
+            return rows
+
+        argv = [sys.executable, str(INVENTORY_SCRIPT), str(work), "--json",
+                "--since", "base"]
+        proc = run_script(argv)
+        if proc.returncode != 0:
+            rows.append(Row(
+                "incremental", "--since 变更集分类", SKIP,
+                "inventory.py --since 退出 {}：{}".format(
+                    proc.returncode, brief(proc.stderr) or brief(proc.stdout)),
+            ))
+            return rows
+        data = parse_json_output(proc.stdout)
+        if not isinstance(data, dict) or not isinstance(data.get("since"), dict):
+            rows.append(Row("incremental", "--since 变更集分类", SKIP,
+                            "JSON 里没有 since 对象：{}".format(brief(proc.stdout))))
+            return rows
+        since = data["since"]
+
+        added_ok = (
+            "10_Notes/增量追加.md" in (since.get("added") or [])
+            and "10_Notes/未跟踪笔记.md" in (since.get("untracked") or [])
+            and "notes.txt" in (since.get("untracked") or [])
+        )
+        rows.append(Row(
+            "incremental", "--since 分流 added / untracked",
+            PASS if added_ok else FAIL,
+            "added={} untracked={}".format(since.get("added"), since.get("untracked")),
+        ))
+
+        md_ok = (
+            "10_Notes/增量追加.md" in (since.get("md_added") or [])
+            and "10_Notes/未跟踪笔记.md" in (since.get("md_added") or [])
+            and "10_Notes/增量入库.md" in (since.get("md_modified") or [])
+        )
+        rows.append(Row(
+            "incremental", "--since 的 md 子集（含未跟踪 md）",
+            PASS if md_ok else FAIL,
+            "md_added={} md_modified={}".format(
+                since.get("md_added"), since.get("md_modified")),
+        ))
+
+        renamed = since.get("renamed") or []
+        renamed_ok = any(
+            str(item.get("from")).endswith("10_Notes/围栏隔离.md")
+            and str(item.get("to")).endswith("10_Notes/围栏隔离改名.md")
+            for item in renamed
+        )
+        rows.append(Row(
+            "incremental", "--since 认出重命名",
+            PASS if renamed_ok else FAIL,
+            "renamed={}".format(renamed),
+        ))
+
+        deleted_ok = "README.md" in (since.get("deleted") or [])
+        rows.append(Row(
+            "incremental", "--since 认出删除",
+            PASS if deleted_ok else FAIL,
+            "deleted={}".format(since.get("deleted")),
+        ))
+
+        rows.append(Row(
+            "incremental", "--since 统计非 md 变更",
+            PASS if since.get("non_md_count") == 2 else FAIL,
+            "non_md_count={}（期望 2：notes.txt + 新图.png）".format(
+                since.get("non_md_count")),
+        ))
+
+    # 非 git 目录：--since 必须退出 2，而不是悄悄返回空变更集
+    with tempfile.TemporaryDirectory() as temp_dir:
+        plain_dir = Path(temp_dir) / "plain"
+        plain_dir.mkdir()
+        (plain_dir / "a.md").write_text("# a\n", encoding="utf-8")
+        proc = run_script([sys.executable, str(INVENTORY_SCRIPT), str(plain_dir),
+                           "--since", "HEAD"])
+        rows.append(Row(
+            "incremental", "非 git 目录 --since 退出 2",
+            PASS if proc.returncode == 2 else FAIL,
+            "exit {} stderr={}".format(proc.returncode, brief(proc.stderr)),
+        ))
+    return rows
+
+
 CASES = [
     ("clean", case_clean),
     ("messy", case_messy),
@@ -645,6 +863,7 @@ CASES = [
     ("docsite", case_docsite),
     ("strict", case_strict),
     ("inventory", case_inventory),
+    ("incremental", case_incremental),
 ]
 
 

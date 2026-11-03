@@ -4,7 +4,11 @@ description: >
   Use when a markdown notes folder or Obsidian vault has become unusable: notes
   flat at the root, one 3000-line file that should be thirty notes, no
   frontmatter, no backlinks, broken relative links, dead MOCs — and the user
-  asks to 整理 / 重构 / 规范化 / 拆分 / 建知识库 / 归档. Also use for a messy
+  asks to 整理 / 重构 / 规范化 / 拆分 / 建知识库 / 归档. Also use for the
+  incremental case in an already-built vault: 记一条 / 收进库 / 收藏一篇 /
+  新增笔记 / 收件箱（00_Inbox）里堆了新东西 / 把这篇/这批新文件放进知识库 —
+  decide 新增模式 vs 改造模式 per file, place it, wire it into the vault,
+  then validate the whole vault. Also use for a messy
   code or docs repository whose markdown should become an orderly, linked vault
   (仓库整理 / 文档站保持导航不动), when they ask how to connect Obsidian to an AI
   (MCP vs direct file access), or how to keep an AI from rewriting their notes.
@@ -18,7 +22,7 @@ license: MIT
 ## 核心原则
 
 1. **vault 就是文件夹。** AI 直接读写 markdown 文件就够了，MCP 不是必需品。
-2. **正文不许重写。** 改造 = 搬家 + 补元数据 + 建链接。原文全量留档，改完用 git 的 rename 相似度自证正文未变（>90% 即通过）。
+2. **正文不许重写。** 改造 = 搬家 + 补元数据 + 建链接。原文全量留档，改完用 git 的 rename 相似度自证正文未变（>90% 即通过）。增量任务里，库外新输入允许结构化整理，但**已成库的笔记正文在任何模式下都不动**。
 3. **链接不许伪造。** 坏的链接改成纯文本并注明去向，不要编一个看起来能点开的目标。
 4. **每一步都能回滚。** 暂存区建好 → 校验通过 → 一次性安装 → commit。不在原地边改边想。
 
@@ -36,7 +40,7 @@ license: MIT
 | 用户要什么 | 走哪条 |
 |---|---|
 | 结构乱、要重构 | 下面的五步改造流程 |
-| 记一条新东西 | 增量流程：查重 → 落一篇 → 挂 MOC → 更新入链 |
+| 记一条新东西 / 库已成型又进来新文件 | 下面的「增量流程」：取变更集 → 判模式 → 查重落库挂链 → 全库校验 |
 | 只是问问题 | 只读，不写任何文件 |
 
 **先判仓库还是笔记库，再决定要不要搬。** `inventory.py` 报 `code-repo` / `docs-site` / `mixed` 时，先看这两条：
@@ -137,10 +141,64 @@ python scripts/roundtrip_check.py <vault_root> --require-full   # 严格：有�
 4. `git add -A && git commit`
 5. 自证：`git show --stat` 里原文件应显示为 `rename ... (95%)`，相似度过低说明正文被改了，回滚
 
+## 增量流程（库已成型，又有新文件进来）
+
+库已经整理好了，用户又丢进来一篇或一批新东西：「记一条」「收进库」「加一篇笔记」「Inbox 里堆了一堆」。**这不是重跑改造流程**——跳过基线快照和全库映射表，只处理增量；但入口和出口一步都不能省。
+
+### 1. 先取变更集，不要靠猜「哪些是新的」
+
+```bash
+git tag vault-incremental-2026-11-03          # 处理前打点，这是下一轮的基线
+python scripts/inventory.py <vault_root> --since <上一轮的 tag 或 commit>
+```
+
+`--since` 用 `git diff --name-status -M` 加未跟踪文件，给出 added / modified / deleted / renamed / untracked 五类，并把 md 子集单独列出来（`md_added` / `md_modified` / `md_deleted` / `md_renamed`）。已提交的旧笔记不会出现在结果里——这就是「哪些是新的」的答案，比看 mtime 靠谱（复制、同步盘、`git checkout` 都会改 mtime）。
+
+- 目标库不是 git 仓库时 `--since` 退出码 2：改成让用户给显式清单（`00_Inbox/` 里的文件、或「就这一篇」），并在汇报里注明「本次变更集来自用户清单」。
+- 没有上一轮基线（第一次增量）：用「`00_Inbox/` 里没处理过的文件 + 用户指名的新文件」当变更集，处理完把当前 HEAD 打上 tag 作为下次基线。
+
+### 2. 逐篇判模式，判不准就问
+
+| 这一篇从哪来 | 走哪个模式 | 允许对正文做什么 |
+|---|---|---|
+| 库外的新输入（用户写的、从网页或别处拖进来的） | **新增模式** | 允许结构化整理：补 frontmatter、顺标题层级、补 `## 相关`；**不许编造原文没有的事实与数字** |
+| 库里已有文件的副本 / 旧版本 / 改过一遍的稿子 | **改造模式** | 一字不改：整份进 `30_Sources/` 存档，再按改造流程第 3 步机械拆分，跑 `roundtrip_check.py` |
+| 判不准 | —— | 停下来问一句：「这篇是外部新内容，还是已有笔记的新版本？」 |
+
+区分标准是**来源**，不是「正文看起来像不像被改过」。同一批里两种都有时逐篇分，不要整批套一个模式。
+
+### 3. 落库：查重 → 落文件 → 挂链
+
+1. **查重（先做，别先写）**：标题和首段拿去全库搜（`grep`，或看 `inventory.py` 的重名与疑似重复）。会撞车就并进原笔记补一节，别新建一篇 90% 重复的；并在笔记里注明合并来源。
+2. **落文件**：放最贴近的目录（`10_Notes/` 一个概念一篇、`40_Projects/` 有产出的、`90_Journal/` 按天的）。frontmatter 八个字段一个不少：`created` 用原文的创作时间（不知道就写处理当天并在正文注明），`updated` 写今天，`status: seed`。
+3. **挂链**：`## 相关` 里 ≥ 2 条正文双链并写清为什么相关；再链进至少一个 MOC（MOC 里加一行索引 + 一句为什么归这个主题）。
+4. **旧文件只动两处**：给老笔记加链接行、把 MOC 的索引行补上。这是增量里唯一允许碰存量文件的地方——不改老笔记正文、不改名、不重排标题。
+
+### 4. 校验要跑全库，不是只校验新文件
+
+```bash
+python scripts/validate_vault.py <vault_root>        # 传全库，不要只传新文件
+```
+
+新笔记的链接可能指向旧笔记的旧名；`dup-stem`、`broken-wikilink`、`orphan`、`not-indexed-by-moc` 只有全库视角才看得见。0 错误再提交，commit message 写清「incremental: 新增 N 篇」。走改造模式的那几篇还要加跑 `roundtrip_check.py`。
+
+### 5. `00_Inbox/` 收尾
+
+- 处理完的输入移进 `99_Archive/`（**原名、原 frontmatter 都不改**）；如果 Inbox 里那一篇本身就是最终成品（不是副本），直接移到目标目录，别留两份。告诉用户选了哪个。
+- **留在 `00_Inbox/` 的 md 永远不会报警**：校验器对 Inbox 豁免出链与 MOC 检查。所以 Inbox 里出现的每一篇都必须在这一轮被处理掉，不能「先放着」。
+- 处理完再打一个本轮 tag，下次 `--since` 用它当基线。
+
+### 增量流程不做的事
+
+- 不重跑盘点的全量结论，不重做旧→新映射表（上一轮已经做完了）
+- 不因为「反正要动」就顺手给旧笔记改名、拆分、重排
+- 不建空 MOC：新笔记够不上一个主题，就挂在最接近的上级 MOC 下
+- 不在 `00_Inbox/` 里写 `[[ ]]` 占位再指望以后补
+
 ## 硬性边界
 
 1. **不丢内容。** 原件被搬走或拆分之前，必须先有一份逐字节相同的副本（`30_Sources/` 存档，或 `99_Archive/` 归档并保留原 frontmatter）。副本校验通过后，被它取代的原件才允许删除；**没有副本就一个字都不许删**。
-2. **不重写正文。** 要压缩、要重写，先问用户。重构任务里任何「顺手改好了」都是越界。
+2. **改造模式不重写正文。** 存量笔记的正文在任何模式下都不动；要压缩、要重写，先问用户。改造任务里任何「顺手改好了」都是越界。（增量任务里，库外新输入允许补字段、补链接、顺标题层级——这是结构化整理，不是重写。）
 3. **不伪造链接。** 见核心原则 3。
 4. **不改写源码锚点。** `File.java:12-34`、`../src/main/java/...`、`路径:行号` 指向的是代码仓库，不是本库文件。它们「点不开」是正常的，**不要改成双链，不要删除**。校验脚本会单独列出它们。
 5. **不臆造事实与数字。** 信息不足写 `> 待确认：...`。尤其不要编指标（MRR / NDCG / QPS / 延迟）。
@@ -161,6 +219,8 @@ python scripts/roundtrip_check.py <vault_root> --require-full   # 严格：有�
 | 「这个死链得消掉，不然校验不过」 | 消死链是最容易滑向编造的地方——会凭空长出一篇「架构说明」 | 目标不存在 → 改纯文本 + 登记缺口。**宁可校验报错，也不造笔记** |
 | 「文件名带空格更好读」 | 空格在命令行、脚本、URL 里都要转义 | 去空格，中文直接连写 |
 | 「结构差不多就行，先装上再说」 | 装完再改，就是在真库里原地施工，没有回滚点 | 暂存区 + 校验 0 错误 + 一次安装 |
+| 「增量就把全量改造再跑一遍最稳」 | 已经整理好的结构会被再动一次，风险远大于收益，也没有回滚点可言 | 用 `--since` 只处理变更集；出口仍然是对全库跑一次校验 |
+| 「这篇不确定放哪，先丢 `00_Inbox/`」 | 校验器对 Inbox 豁免出链与 MOC 检查，留在那里永远不会报警，等于隐身 | 这一轮就判模式、落位；判不了就问用户 |
 
 ## 校验契约
 
@@ -199,5 +259,7 @@ python scripts/roundtrip_check.py <vault_root> --require-full   # 严格：有�
 - 你说「结构差不多就行，先提交」
 - 你在原地直接改，没有暂存副本
 - 校验脚本还没跑你就说已完成
+- 你在增量任务里给旧笔记改名 / 重排标题 / 顺手润色正文
+- 你把没处理的文件留在 `00_Inbox/` 就说做完了（那里永不报警）
 
 **以上任一条成立，说明你已经偏离了「搬家 + 标注 + 连接」的边界。**

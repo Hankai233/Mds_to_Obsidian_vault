@@ -38,7 +38,7 @@
 ## 四条硬承诺
 
 1. **不丢内容。** 原件被搬走或拆分之前，必须先有一份逐字节相同的副本（`30_Sources/` 存档，或 `99_Archive/` 归档）。没有副本，一个字都不许删。
-2. **不重写正文。** 改造 = 搬家 + 补元数据 + 建链接。拆出的笔记只做标题降级（`###`→`##`、`####`→`###`），去掉标题后能反向还原成原文；git 里原文件应显示为 `rename` 且相似度 >90%。要压缩、要重写，先问你。
+2. **不重写正文。** 改造 = 搬家 + 补元数据 + 建链接。拆出的笔记只做标题降级（`###`→`##`、`####`→`###`），去掉标题后能反向还原成原文；git 里原文件应显示为 `rename` 且相似度 >90%。**已成库的笔记正文在任何模式下都不动**；增量任务里库外新输入允许结构化整理（补字段、补链接、顺层级），但同样不许编造。要压缩、要重写，先问你。
 3. **不伪造链接。** 坏链接三选一：找到真实目标改成双链 → 目标在代码仓库就保留原样 → 都不行改成纯文本并注明「原仓库文件，本库未收录」。**宁可校验报错，也不造笔记。**
 4. **每一步都能回滚。** 暂存区建好 → 校验 0 错误 → 一次性安装 → `git commit`。不在真库里原地边改边想。
 
@@ -64,11 +64,13 @@ Copy-Item -Recurse -Force .\* $dst
 
 ### 2. 触发
 
-直接说人话即可，`description` 里的触发词覆盖「整理 / 重构 / 规范化 / 拆分 / 建知识库 / 归档」，也覆盖混着代码与文档的仓库：
+直接说人话即可，`description` 里的触发词覆盖「整理 / 重构 / 规范化 / 拆分 / 建知识库 / 归档」，也覆盖库成型后的增量场景和混着代码与文档的仓库：
 
 - 「把这个目录整理成 Obsidian 知识库：`E:\notes`」
 - 「`面试题.md` 有 3000 行，拆成一个技术点一篇」
 - 「库里的 frontmatter 和双链不规范，帮我规范化一下」
+- 「库已经整理好了，这篇新文章收进库」
+- 「`00_Inbox/` 里堆了一批新文件，帮我归进去」
 
 ### 3. 过程
 
@@ -82,6 +84,7 @@ agent 会分八步走（第 0 步基线快照 + 七步改造）。**第 0 步先
 
 ```bash
 python scripts/inventory.py <vault_root>       # 动手前：先看清楚烂在哪
+python scripts/inventory.py <vault_root> --since <tag|commit>  # 增量：自该提交以来变了哪些文件
 python scripts/validate_vault.py <vault_root>  # 安装前：必须 0 错误
 python scripts/validate_vault.py <vault_root> --profile docs-site  # 文档站：不要求页面互链
 python scripts/roundtrip_check.py <vault_root> # 拆分过的库：逐篇证明正文没被改
@@ -95,7 +98,18 @@ git show --stat        # 原文件应显示为 rename，相似度 >90%；过低�
 git revert <commit>    # 不满意就整体回滚
 ```
 
-想先确认工具链本身没坏，跑 `python tests/run_eval.py`（40 项，含七个夹具库）。
+想先确认工具链本身没坏，跑 `python tests/run_eval.py`（52 项，含九个夹具库）。
+
+### 5. 库已经成型，只想收新东西
+
+不用重跑全套改造（基线快照、旧→新映射表都免了）：
+
+```bash
+git tag vault-incremental-2026-11-03                  # 处理前打点，这是下一轮基线
+python scripts/inventory.py <vault_root> --since <上一轮的 tag 或 commit>
+```
+
+`--since` 用 `git diff --name-status -M` 加 `git ls-files --others` 给出变更集（新增 / 修改 / 删除 / 重命名 / 未跟踪），并把 md 子集单独列成 `md_added` / `md_modified` / `md_deleted` / `md_renamed`。随后逐篇判模式：库外新输入走新增模式（可结构化整理、不许编造），库里已有文件的副本走改造模式（一字不改、先存档再拆分）。最后仍然要对**全库**跑 `validate_vault.py`——新笔记的坏链可能坏在旧笔记那一侧，只有全库视角才看得见。完整流程见 SKILL.md 的「增量流程」一节。
 
 ## 仓库结构
 
@@ -115,7 +129,8 @@ obsidian-vault-builder/
 │   └── vault-AGENTS.md           # 库内规范骨架，落地时复制成目标库根目录的 AGENTS.md
 └── tests/
     ├── run_eval.py               # 一条命令跑完全部回归
-    └── fixtures/{clean,messy,split}/   # 三个夹具库
+    └── fixtures/                 # 九个夹具库：clean / messy / split / urlsrc / comments /
+                                  #   outside / docsite / casematch / incremental
 ```
 
 三个脚本都是 Python 3 标准库、零第三方依赖，可脱离技能单独用。
@@ -134,6 +149,7 @@ obsidian-vault-builder/
 python scripts/inventory.py <vault_root>            # 人类可读
 python scripts/inventory.py <vault_root> --json     # 机器可读
 python scripts/inventory.py <vault_root> --top 20 --max-files 500
+python scripts/inventory.py <vault_root> --since v1 --json   # 增量：自 tag/commit 以来的变更集
 ```
 
 输出：文件与扩展名分布、每篇 md 的行数/出链/嵌入/BOM/CRLF、切分候选榜（按 `^## N.` 计数）、重名与疑似重复、失效链接与代码仓库锚点、附件孤儿、工程类型（`notes-vault` / `code-repo` / `docs-site` / `mixed`）、被文档站导航引用的路径（`move_blocked`）。**只读，不改任何文件。**
@@ -145,7 +161,10 @@ python scripts/inventory.py <vault_root> --top 20 --max-files 500
 - **注释、行内代码、缩进代码块里的 `[[X]]` 不算死链**（`%%...%%`、`<!-- -->`、行内反引号、空行后 4 空格缩进），与校验器同一口径。
 - **`case_mismatch` 与 `dead_links` 分开报**：`[[guide]]` 对上 `Guide.md` 归 `case_mismatch`（`{path,target,actual}`），不再混进死链；大小写口径与校验器一致（严格匹配）。
 - **`split_too_small`**：总行数 <40 或每节平均 <8 行的文档不推荐拆分，单独列出并给 `reason`，不混进切分候选榜。
-- `--json` 顶层含 `files dirs md_files dead_links duplicates attachments doc_refs hygiene big_files build_systems code_anchors fence_unclosed project_kind recommendations split_too_small case_mismatch` 等字段，可程序化消费。
+- `--json` 顶层含 `files dirs md_files dead_links duplicates attachments doc_refs hygiene big_files build_systems code_anchors fence_unclosed project_kind recommendations split_too_small case_mismatch since` 等字段，可程序化消费。
+- **`--since <tag|commit>`** 给增量流程用：`git diff --name-status -M --relative <ref> -- .` 加 `git ls-files --others --exclude-standard`，输出 `since: {ref, resolved, added, untracked, modified, deleted, renamed[{from,to}], type_changed, md_added, md_modified, md_deleted, md_renamed, non_md_count}`。人类可读模式多出「## 0. 变更集」小节（不改变原来 1-11 的编号）。不在 git 仓库里退出码 `2`，不会悄悄返回空变更集；`renamed` 的 md 目标同时计入 `md_added`（对它来说就是「新出现的一篇」）。
+
+退出码：`0` 正常 · `2` 路径不存在 / 参数错误 / `--since` 用在非 git 目录。
 
 ### 校验：`validate_vault.py`
 
@@ -223,7 +242,7 @@ python scripts/roundtrip_check.py <vault_root> --require-full   # 严格覆盖
 python tests/run_eval.py           # 可加 --verbose 看子进程原始输出
 ```
 
-`tests/fixtures/` 七套夹具：`clean`（必须 0 错误 0 警告）、`messy`（覆盖全部 15 条 ERROR 与 9 条 WARN，且断言 `![[存在的图.png]]` 与 `[[notes/a/Guide]]` 不误报）、`split`（一篇照搬、一篇被同义改写，往返检查必须抓出后者）、`urlsrc`（`source: https://...` 是外部来源不是双链，往返检查不得误报 `source-broken`）、`comments`（注释/行内代码/缩进代码里的 `[[X]]` 不得误报）、`outside`（逃库链接：源码记锚点、坏链报错）、`docsite`（文档站页面互不链接，`--profile docs-site` 下零错误）、`casematch`（`[[guide]]` 对 `Guide.md`：盘点记 `case_mismatch`、校验器报 `broken-wikilink`，两边口径一致）。`strict` 与 `inventory` 两个用例复用上面的夹具，分别验证 `--require-full` 与 `case_mismatch`。
+`tests/fixtures/` 九套夹具：`clean`（必须 0 错误 0 警告）、`messy`（覆盖全部 15 条 ERROR 与 9 条 WARN，且断言 `![[存在的图.png]]` 与 `[[notes/a/Guide]]` 不误报）、`split`（一篇照搬、一篇被同义改写，往返检查必须抓出后者）、`urlsrc`（`source: https://...` 是外部来源不是双链，往返检查不得误报 `source-broken`）、`comments`（注释/行内代码/缩进代码里的 `[[X]]` 不得误报）、`outside`（逃库链接：源码记锚点、坏链报错）、`docsite`（文档站页面互不链接，`--profile docs-site` 下零错误）、`casematch`（`[[guide]]` 对 `Guide.md`：盘点记 `case_mismatch`、校验器报 `broken-wikilink`，两边口径一致）、`incremental`（clean 收进一篇新笔记之后的结果态：新笔记有 8 字段 frontmatter、≥2 条正文双链、被 MOC 索引，且 `00_Inbox/` 无遗留 md，必须仍是 0 错误 0 警告）。`strict`、`inventory`、`incremental` 三个用例复用夹具，分别验证 `--require-full`、`case_mismatch`，以及 `--since` 在临时 git 副本上的变更集分类（新增/未跟踪/修改/删除/重命名 + md 子集 + 非 git 目录退出 2）。
 
 | 维度 | 无技能 | 有技能 |
 |---|---|---|
@@ -239,7 +258,9 @@ python tests/run_eval.py           # 可加 --verbose 看子进程原始输出
 
 ## 已知限制
 
-- **增量分支没有对照测试。** 「收件箱单条输入 → 落一篇笔记」的流程和边界都写了，但只验证过存量库重构。
+- **增量流程只自证到工具能证的部分。** `incremental` 夹具证明「收进一篇新笔记之后必须仍是 0 错误 0 警告」，`--since` 的变更集分类有临时 git 仓库上的对照测试；但「拖进来一篇真实长文 → 逐篇判模式 → 落库」没有端到端的「无技能 vs 有技能」对照，判模式仍然靠 agent 遵守 SKILL.md 的规则，脚本查不出来。
+- **`--since` 依赖 git。** 库不在版本控制里就没有变更集，只能退回用户给的显式清单；它比对的是「提交 → 工作区」，所以未提交的历史改动也会被算进这一轮（这是有意的保守方向：宁可多处理几篇）。
+- **`00_Inbox/` 是校验盲区。** 校验器对 Inbox 豁免出链与 MOC 索引检查，留在那里的新文件永远不会报警——只能靠流程约束（SKILL.md 要求每轮清空 Inbox，`incremental` 用例也断言没有遗留 md）。
 - **仓库模式只有清单、没有端到端实战。** `inventory.py` 能识别 `docs-site`/`code-repo` 并列出被导航引用的路径（`move_blocked`），SKILL.md 也写了「不搬目录」的分支；但「把真实 mkdocs 仓库改造成 vault」还没作为夹具跑过一遍。
 - **往返检查只覆盖「存档 → 拆分」这条主线。** 默认 `--allow-added "相关,延伸问题"`，靠 `## 相关` 小节整段剔除来避免误判；新增的其它结构（比如自己加的「延伸问题」小节）要在 `--allow-added` 里显式列出，否则会被判成改写。
 - **`30_Sources/` 存档会报 `title-mismatch`（WARN，属正常）。** 存档保留原文的第一个 H1，而 frontmatter 的 `title` 要跟文件名一致（例如文件名 `面试题库原文.md`、H1 仍是 `# 面试题库`），两者天然不同——这条警告是结构性的，别为了消警告去改存档正文。
@@ -256,7 +277,7 @@ python tests/run_eval.py           # 可加 --verbose 看子进程原始输出
 - 改了 frontmatter 字段或目录结构，必须同步改 `scripts/validate_vault.py` 里的 `REQUIRED_FIELDS` / `DIR_TYPE` / `VALID_TYPES`，否则会误报；改完跑 `python tests/run_eval.py`。
 - 新增/删除校验规则 id 时，`tests/run_eval.py` 里的预期规则集合要跟着改（断言是 SUPERSET，新增规则不会误伤，删规则会 FAIL）。
 - `README.md` 和 `SKILL.md` 描述的是同一个东西，改流程时两边都要动，别只改一边。
-- 新增/修改判定语义（比如新的剥离规则、新 profile）时，同步加一条 `tests/fixtures/` 用例——现在 40 项断言覆盖校验器、往返检查、盘点三个脚本，改坏任意一个都会被抓住。
+- 新增/修改判定语义（比如新的剥离规则、新 profile、新的 `--since` 行为）时，同步加一条 `tests/fixtures/` 用例——现在 52 项断言覆盖校验器、往返检查、盘点三个脚本，改坏任意一个都会被抓住。
 - `SKILL.md` 的 `description` 只写「何时触发」，不要写流程摘要——实测把流程写进描述会让 agent 跳过正文直接干。
 - 新增平台坑时写进 SKILL.md 的「平台坑」一节，并注明是哪个平台实测的，不要凭想象补。
 

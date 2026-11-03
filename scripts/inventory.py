@@ -3,6 +3,7 @@
 
 Usage:
     python scripts/inventory.py <root> [--json] [--top N] [--max-files N]
+    python scripts/inventory.py <root> --since <commit|tag> [--json]
 
 What it reports:
 
@@ -27,11 +28,18 @@ What it reports:
   * hygiene: BOM, CRLF, empty files, spaces in names, paths deeper than 6,
     ʻ未命名/副本/copy` names, .obsidian attachment folder setting
   * 3-5 data-driven next-step recommendations
+  * with `--since <commit|tag>`: the change set against that commit
+    (`git diff --name-status -M`, plus untracked files from `git ls-files
+    --others`), split into added / modified / deleted / renamed / untracked,
+    with the md-only subset called out. This is the entry point of the
+    incremental pass: it answers "which files are actually new" without
+    guessing. Needs a git checkout; `--since` elsewhere exits 2.
 
 The script never writes anything. It uses only the Python 3 standard library
 and runs on Windows and Linux. Deterministic: no timestamps in the output.
 
-Exit codes: 0 ok, 2 path missing / not a directory / bad arguments.
+Exit codes: 0 ok, 2 path missing / not a directory / bad arguments /
+--since used outside a git checkout.
 """
 
 import argparse
@@ -42,6 +50,7 @@ import os
 import posixpath
 import re
 import stat
+import subprocess
 import sys
 import unicodedata
 import urllib.parse
@@ -59,6 +68,13 @@ TEXT_SCAN_BYTES = 2 * 1024 * 1024
 MIN_SECTION_BODY_LINES = 8
 MIN_SPLIT_FILE_LINES = 40
 BOM = b"\xef\xbb\xbf"
+# `git diff` on a big vault is still fast; a hung git (network FS, credential
+# prompt) must not hang the inventory forever.
+GIT_TIMEOUT = 30
+GIT_STATUS_LABELS = {
+    "A": "新增", "M": "修改", "D": "删除",
+    "R": "重命名", "C": "复制", "T": "类型变更",
+}
 
 # Directories that are never part of the note inventory. `.obsidian` is read
 # explicitly for app.json but otherwise skipped so plugin blobs do not swamp
@@ -1147,7 +1163,154 @@ def group_by(items, keyfunc):
     return groups
 
 
-def build_inventory(root, top, max_files):
+# ---------------------------------------------------------------------------
+# incremental pass: change set against a git commit (`--since`)
+# ---------------------------------------------------------------------------
+
+
+def run_git(root, args):
+    """Run git inside `root`. Returns (ok, stdout, stderr); never raises."""
+    env = dict(os.environ)
+    # A trailing colon would make git treat "r" as an empty repo path; and an
+    # interactive credential prompt is never acceptable inside a read-only scan.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "-c", "core.quotepath=false"] + list(args),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=GIT_TIMEOUT,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, "", "无法运行 git（%s）" % exc
+    if proc.returncode != 0:
+        return False, proc.stdout or "", (proc.stderr or "").strip()
+    return True, proc.stdout or "", ""
+
+
+def git_error_line(stderr):
+    """First meaningful line of git stderr, for a one-line error message."""
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return "git 命令失败"
+
+
+def parse_name_status(stdout):
+    """Parse `git diff --name-status` output into [(status, old, new|None)]."""
+    entries = []
+    for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0].strip()[:1] or "?"
+        if status in ("R", "C"):
+            if len(parts) >= 3:
+                entries.append((status, parts[1], parts[2]))
+        else:
+            entries.append((status, parts[1], None))
+    return entries
+
+
+def collect_since(root, ref):
+    """Change set between `ref` and the working tree (read-only).
+
+    Returns (data, error). `data` is None when the vault is not a git checkout
+    or `ref` does not resolve. Paths are relative to the vault root and use
+    forward slashes, matching every other path in this report.
+    """
+    ok, _, stderr = run_git(root, ["rev-parse", "--is-inside-work-tree"])
+    if not ok:
+        return None, "不是 git 仓库：%s" % git_error_line(stderr)
+
+    ok, stdout, stderr = run_git(
+        root, ["rev-parse", "--verify", "--quiet", ref + "^{commit}"]
+    )
+    if not ok:
+        return None, "git 里找不到提交或标签 %r" % ref
+    resolved = stdout.strip()
+
+    ok, stdout, stderr = run_git(
+        root,
+        ["diff", "--name-status", "-M", "--relative", resolved, "--", "."],
+    )
+    if not ok:
+        return None, "git diff 失败：%s" % git_error_line(stderr)
+
+    ok, untracked_out, stderr = run_git(
+        root, ["ls-files", "--others", "--exclude-standard"]
+    )
+    # Untracked files are best-effort: a repo with odd ignore rules should not
+    # invalidate the diff itself.
+    untracked = []
+    if ok:
+        for line in untracked_out.splitlines():
+            line = line.strip()
+            if line:
+                untracked.append(line.replace("\\", "/"))
+
+    added, modified, deleted, renamed, type_changed = [], [], [], [], []
+    for status, old, new in parse_name_status(stdout):
+        old = old.replace("\\", "/")
+        if status == "A":
+            added.append(old)
+        elif status == "M":
+            modified.append(old)
+        elif status == "D":
+            deleted.append(old)
+        elif status in ("R", "C"):
+            target = (new or "").replace("\\", "/")
+            renamed.append({"from": old, "to": target, "copy": status == "C"})
+        elif status == "T":
+            type_changed.append(old)
+        else:
+            # Unknown letter: report it as modified rather than dropping it —
+            # a silently missing file in an incremental pass is the bug that
+            # matters most.
+            modified.append(old)
+
+    def md_only(paths):
+        return sorted(p for p in paths if p.lower().endswith(".md"))
+
+    md_added = sorted(set(md_only(added)) | set(md_only(untracked))
+                      | set(md_only(item["to"] for item in renamed)))
+    md_modified = md_only(modified)
+    md_deleted = md_only(deleted)
+    md_renamed = [
+        item for item in renamed
+        if item["to"].lower().endswith(".md") or item["from"].lower().endswith(".md")
+    ]
+
+    all_paths = set(added) | set(untracked) | set(modified) | set(deleted)
+    for item in renamed:
+        all_paths.add(item["to"])
+    non_md = sum(1 for path in all_paths if not path.lower().endswith(".md"))
+
+    return {
+        "ref": ref,
+        "resolved": resolved,
+        "added": sorted(added),
+        "untracked": sorted(untracked),
+        "modified": sorted(set(modified)),
+        "deleted": sorted(deleted),
+        "renamed": sorted(renamed, key=lambda item: item["to"]),
+        "type_changed": sorted(type_changed),
+        "md_added": md_added,
+        "md_modified": md_modified,
+        "md_deleted": md_deleted,
+        "md_renamed": md_renamed,
+        "non_md_count": non_md,
+    }, None
+
+
+def build_inventory(root, top, max_files, since_data=None):
     root = Path(root)
     files, dirs = enumerate_files(root)
     deep, sampled = choose_deep_files(files, max_files)
@@ -1434,6 +1597,7 @@ def build_inventory(root, top, max_files):
         "move_blocked_reasons": project["move_blocked_reasons"],
         "doc_refs": project["doc_refs"],
         "hygiene": hygiene,
+        "since": since_data,
         "recommendations": [],
     }
     data["recommendations"] = make_recommendations(data)
@@ -1446,6 +1610,46 @@ def make_recommendations(data):
     def add(text):
         if text and text not in recs:
             recs.append(text)
+
+    since = data.get("since")
+    if since:
+        changed_md = (
+            len(since["md_added"]) + len(since["md_modified"])
+            + len(since["md_deleted"]) + len(since["md_renamed"])
+        )
+        touched = (
+            len(since["added"]) + len(since["untracked"]) + len(since["modified"])
+            + len(since["deleted"]) + len(since["renamed"])
+        )
+        if since["md_added"]:
+            shown = "、".join(since["md_added"][:3])
+            if len(since["md_added"]) > 3:
+                shown += " 等"
+            add(
+                "自 %s 以来新增 %d 篇 md（%s）→ 走增量流程：查重 → 落文件 → 挂 MOC → "
+                "全库跑 validate_vault.py；不要重跑全量改造（基线快照、旧→新映射表都不需要）" % (
+                    since["ref"], len(since["md_added"]), shown,
+                )
+            )
+        elif changed_md:
+            add(
+                "自 %s 以来没有新增 md，但有 %d 篇 md 被修改 / 删除 / 重命名 → 先确认这些改动"
+                "不是改造模式的误伤（存量正文不许变），改过的笔记要同步刷新 updated" % (
+                    since["ref"], changed_md,
+                )
+            )
+        elif touched:
+            add(
+                "自 %s 以来没有 md 变更（只有 %d 个非 md 文件）→ 本次不必走增量笔记流程" % (
+                    since["ref"], since["non_md_count"],
+                )
+            )
+        else:
+            add(
+                "自 %s 以来没有任何改动 → 确认基线提交打得对不对；换更早的提交或 tag 再试" % (
+                    since["ref"],
+                )
+            )
 
     kind = data["project_kind"]
     doc_refs = data.get("doc_refs") or {}
@@ -1571,6 +1775,45 @@ def build_human(data, top):
             data["project_kind"], files["total"], human_size(files["bytes"]), sampled_note,
         )
     )
+
+    # 0. change set (only with --since; keeps 1-11 stable when absent)
+    since = data.get("since")
+    if since:
+        lines.append("")
+        lines.append(
+            "## 0. 变更集（自 %s = %s 以来）" % (since["ref"], since["resolved"][:12])
+        )
+        rows = []
+
+        def add_since_row(label, items):
+            if not items:
+                return
+            shown = "、".join(items[:4])
+            if len(items) > 4:
+                shown += " 等 %d 个" % len(items)
+            rows.append([label, str(len(items)), shown])
+
+        add_since_row("新增", since["added"])
+        add_since_row("未跟踪", since["untracked"])
+        add_since_row("修改", since["modified"])
+        add_since_row("删除", since["deleted"])
+        add_since_row(
+            "重命名",
+            ["%s → %s" % (item["from"], item["to"]) for item in since["renamed"]],
+        )
+        add_since_row("类型变更", since["type_changed"])
+        if rows:
+            lines.extend(render_table(["状态", "数量", "文件"], rows, [8, 6, 60]))
+        else:
+            lines.append("自该提交以来没有任何改动。")
+        lines.append(
+            "本次要处理的 md：新增 %d / 修改 %d / 删除 %d ｜ 非 md 变更 %d 个" % (
+                len(since["md_added"]),
+                len(since["md_modified"]),
+                len(since["md_deleted"]),
+                since["non_md_count"],
+            )
+        )
 
     # 1. file types
     lines.append("")
@@ -1920,6 +2163,11 @@ def main(argv=None):
         "--max-files", type=int, default=DEFAULT_MAX_FILES,
         help="超过 N 个文件时抽样分析并标记 sampled（默认 %d）" % DEFAULT_MAX_FILES,
     )
+    parser.add_argument(
+        "--since", metavar="REF",
+        help="增量盘点：列出相对该提交 / 标签的变更集（git diff + 未跟踪文件，"
+             "需要 git 仓库；不在仓库里则退出码 2）",
+    )
     args = parser.parse_args(argv)
 
     if args.top < 1 or args.max_files < 1:
@@ -1930,7 +2178,14 @@ def main(argv=None):
         print("错误：路径不存在或不是目录：%s" % args.root, file=sys.stderr)
         return 2
 
-    data = build_inventory(root, args.top, args.max_files)
+    since_data = None
+    if args.since:
+        since_data, error = collect_since(root, args.since)
+        if error:
+            print("错误：%s" % error, file=sys.stderr)
+            return 2
+
+    data = build_inventory(root, args.top, args.max_files, since_data)
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
     else:
